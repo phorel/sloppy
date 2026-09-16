@@ -3790,7 +3790,7 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT, asker: str = "") -> str:
     debug(f"System prompt:\n{system_prompt}")
     debug(f"User prompt:\n{prompt}")
     text = _generate_reply(messages, mode)
-    _record_last_llm_call(messages[0]["content"], messages, prompt, text)
+    _record_last_llm_call(messages, text)
     return text
 
 
@@ -3822,25 +3822,36 @@ def _call_llm_vision(url: str, prompt: str, asker: str = "") -> str:
     debug(f"System prompt:\n{system_prompt}")
     debug(f"User prompt (with image): {prompt} -> {url}")
     text = _generate_reply(messages, MODE_VISION)
-    _record_last_llm_call(messages[0]["content"], messages, prompt, text)
+    _record_last_llm_call(messages, text)
     return text
 
 
-def _record_last_llm_call(system_prompt: str, messages: list, prompt: str, text: str) -> None:
+def _record_last_llm_call(messages: list, text: str) -> None:
     """Store the full record of this call for the TUI debug view (press 'd').
 
-    Assembled while the call happens so it can be shown on demand: the system
-    prompt, the messages exactly as they were sent to the model, the user
-    prompt, and the returned text. Replaces the previous call's record.
+    Assembled while the call happens so it can be shown on demand, and showing
+    exactly what went over the wire: two messages, a system one and a user one.
+
+    It used to print the system message, then repr(messages) -- which contains
+    that same system message again -- then the user message a second time as
+    well. Nothing was ever sent twice; it only looked that way, and it looked
+    that way in the one screen somebody would open to find out. Reported by
+    Alexander after reading the summary and the recent chat twice in a prompt
+    that contained them once.
     """
+    parts = ["=== Last LLM call ===", f"{len(messages)} messages sent"]
+    for message in messages:
+        content = message["content"]
+        if not isinstance(content, str):
+            # A vision call: text and an image_url part ride together.
+            content = "\n".join(
+                part.get("text") or part.get("image_url", {}).get("url", "")
+                for part in content
+            )
+        parts.append(f"[{message['role']}]\n{content}")
+    parts.append(f"[output]\n{text}")
     with _prompt_lock:
-        _last_llm_call["text"] = (
-            "=== Last LLM call ===\n\n"
-            f"[System prompt]\n{system_prompt}\n\n"
-            f"[Messages]\n{repr(messages)}\n\n"
-            f"[User message]\n{prompt}\n\n"
-            f"[Output]\n{text}"
-        )
+        _last_llm_call["text"] = "\n\n".join(parts)
 
 
 def get_last_llm_call() -> str:
@@ -4358,14 +4369,80 @@ def _process_pending(sock: socket.socket) -> None:
             _busy["on"] = False
 
 
+def _merge_passages(first: list, second: list) -> list:
+    """`first` then whatever of `second` it does not already carry.
+
+    The searches overlap by design -- a line that answers the question is often
+    also what the room is talking about -- and the same passage twice is a
+    waste of the prompt and reads as a stutter.
+    """
+    return first + [p for p in second if p not in first]
+
+
+def _recall_passages(prompt: str, recent: list, asker: str,
+                     cutoff: float | None) -> list:
+    """The passages three searches between them think are worth showing.
+
+    Each runs against its OWN query, which is the point. The relevance floor is
+    a fraction of `ideal`, and `ideal` is the sum of IDF over every query term,
+    so terms from one concern raise the bar for another when they share a
+    query. Measured against the real 2026-line log, "is probe fat" asked in a
+    channel that had moved on: the question alone gave 3 discriminating terms,
+    ideal 12.11 and 17 lines recalled; the question plus its three trailing
+    lines gave 22 terms, ideal 111.01 and NOTHING, with 34 lines about it
+    sitting in the log. The busier the room, the less it could remember about
+    what it had actually been asked. Worse, those trailing lines are captured
+    in the log and then excluded from the pool by the cutoff: they add their
+    rare words to the bar and nothing can ever match them back.
+    """
+    historical = _asks_about_the_past(prompt)
+    subjects = _recall_subjects(prompt, asker) if historical else []
+    settings = recall.Settings(
+        min_relevance=RECALL_MIN_RELEVANCE,
+        half_life_days=0.0 if historical else RECALL_HALF_LIFE_DAYS,
+        passages=RECALL_PASSAGES,
+    )
+    # What was asked.
+    passages = _recall_store.search(prompt, settings, before=cutoff,
+                                    nicks=subjects)
+    if recent and not historical:
+        # What the room is talking about, which is all a follow-up with no
+        # content of its own ("what do you reckon") has to go on. It earns its
+        # slots on its own terms instead of taxing the question's.
+        passages = _merge_passages(passages, _recall_store.search(
+            " ".join(recent), settings, before=cutoff))
+    if asker and not historical:
+        # What the person asking has said about it before, which is what makes
+        # a reply sound like it remembers them. Their profile carries their
+        # last few lines whatever the subject; this carries the older ones
+        # about what they are asking now.
+        #
+        # Without the recency prior, deliberately: somebody's own history does
+        # not get less true with age. "my espresso machine leaks" is as
+        # relevant to a descaling question four months later as it was that
+        # day, and at the channel's half-life it had decayed to a twentieth of
+        # its score, under the floor, which is where this was caught. The floor
+        # still has to be cleared, so it is term overlap doing the work.
+        mine = [p for p in _recall_store.search(
+            prompt, dataclasses.replace(settings, half_life_days=0.0),
+            before=cutoff, nicks=[asker])
+            if p not in passages]
+        if mine:
+            # One slot is kept for them, or a search that filled every slot
+            # would mean the bot never remembers who it is talking to.
+            passages = passages[:RECALL_PASSAGES - 1] + mine
+    return passages[:RECALL_PASSAGES]
+
+
 def _recall_section(prompt: str, senders: list, lines: list,
                     times: list, asker: str = "") -> str:
     """Passages from the channel's past worth showing, or "".
 
-    The query is the current prompt plus the last few channel lines, so recall
-    follows the conversation rather than one message. Everything already in the
-    verbatim recent block is excluded: quoting back what sits three paragraphs
-    below it is not recall.
+    Up to three searches, each against its own query so that none of them
+    raises the relevance bar for another: what was ASKED, what the room is
+    talking about, and what the person asking has said about it before.
+    Everything already in the verbatim recent block is excluded: quoting back
+    what sits three paragraphs below it is not recall.
 
     A question ABOUT the past is run differently (see _asks_about_the_past):
     scoped to whoever it names -- or to the asker, when it says "i" -- and with
@@ -4385,46 +4462,9 @@ def _recall_section(prompt: str, senders: list, lines: list,
         for sender, text in zip(senders[-RECALL_QUERY_LINES:],
                                 lines[-RECALL_QUERY_LINES:], strict=False)
     ]
-    historical = _asks_about_the_past(prompt)
-    subjects = _recall_subjects(prompt, asker) if historical else []
-    # A question about the past is about THIS question, not about whatever the
-    # room was saying a minute ago: the trailing lines would drag the current
-    # topic into a search meant to leave it.
-    query = prompt if historical else " ".join([prompt, *recent])
-    settings = recall.Settings(
-        min_relevance=RECALL_MIN_RELEVANCE,
-        half_life_days=0.0 if historical else RECALL_HALF_LIFE_DAYS,
-        passages=RECALL_PASSAGES,
-    )
-    # Everything the verbatim recent block already shows is off limits.
-    cutoff = times[-min(len(times), CONTEXT_RECENT_LINES)] if times else None
-    passages = _recall_store.search(query, settings, before=cutoff,
-                                    nicks=subjects)
-    if asker and not historical:
-        # A second pass over the asker's own log. The channel-wide search above
-        # answers "what has been said about this"; this one answers "what has
-        # THIS PERSON said about this", which is what makes a reply sound like
-        # it remembers them. Their profile carries their last few lines
-        # whatever the subject; this carries the older ones that happen to be
-        # about what they are asking now, which is the half a fixed window of
-        # recent lines can never hold.
-        #
-        # Without the recency prior, and that is the point rather than an
-        # oversight: somebody's own history does not get less true with age.
-        # "my espresso machine leaks" is as relevant to a descaling question
-        # four months later as it was that day, and at the channel's half-life
-        # it had decayed to a twentieth of its score -- under the floor, which
-        # is where this was measured failing. The relevance floor still has to
-        # be cleared, so it is the term overlap doing the work and not the age.
-        mine = [p for p in _recall_store.search(
-            query, dataclasses.replace(settings, half_life_days=0.0),
-            before=cutoff, nicks=[asker])
-            if p not in passages]
-        if mine:
-            # One slot is kept for them. Otherwise a channel-wide search that
-            # filled every slot would mean the bot never remembers the person
-            # it is actually talking to, which is the case this is for.
-            passages = (passages[:RECALL_PASSAGES - 1] + mine)[:RECALL_PASSAGES]
+    passages = _recall_passages(prompt, recent, asker,
+                                times[-min(len(times), CONTEXT_RECENT_LINES)]
+                                if times else None)
     if not passages:
         return ""
     blocks = [

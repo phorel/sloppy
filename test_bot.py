@@ -2045,7 +2045,7 @@ class TestLLMCallDebugRecord(unittest.TestCase):
             llmbot_core._recent_lines.clear()
             llmbot_core._recent_senders.clear()
 
-    def test_call_records_system_prompt_messages_user_and_output(self):
+    def test_call_records_every_message_and_the_output(self):
         user_prompt = "what is 2+2?"
         mock_response = mock.MagicMock()
         mock_response.choices = [mock.MagicMock()]
@@ -2060,18 +2060,45 @@ class TestLLMCallDebugRecord(unittest.TestCase):
         self.assertEqual(result, "The answer is 42.")
         messages = mock_create.call_args.kwargs["messages"]
         record = llmbot_core.get_last_llm_call()
-        # system prompt, shown on its own
-        self.assertIn("[System prompt]", record)
-        self.assertIn(messages[0]["content"], record)
-        # messages verbatim, in the same format they were sent to the model
-        self.assertIn("[Messages]", record)
-        self.assertIn(repr(messages), record)
-        # the user prompt, shown on its own
-        self.assertIn("[User message]", record)
-        self.assertIn(user_prompt, record)
-        # the returned output
-        self.assertIn("[Output]", record)
+        self.assertIn(f"{len(messages)} messages sent", record)
+        for message in messages:
+            self.assertIn(f"[{message['role']}]", record)
+            self.assertIn(message["content"], record)
+        self.assertIn("[output]", record)
         self.assertIn("The answer is 42.", record)
+
+    def test_nothing_is_shown_twice(self):
+        # The record used to print the system message, then repr(messages)
+        # which contains it again, then the user message a second time too.
+        # Nothing was ever SENT twice -- but the one screen somebody opens to
+        # check that said otherwise, which cost a real investigation.
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = "UNIQUE_SUMMARY_MARKER"
+            llmbot_core._rolling["at"] = time.time() - 60
+            llmbot_core._recent_senders.append("alice")
+            llmbot_core._recent_lines.append("UNIQUE_CHAT_MARKER")
+            llmbot_core._recent_times.append(time.time() - 60)
+        self.addCleanup(self._clear_rolling)
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "ok"
+        response.choices[0].finish_reason = "stop"
+        with mock.patch.object(llmbot_core._llm_client.chat.completions,
+                               "create", return_value=response):
+            llmbot_core._call_llm("UNIQUE_USER_MARKER")
+        record = llmbot_core.get_last_llm_call()
+        for marker in ("UNIQUE_SUMMARY_MARKER", "UNIQUE_CHAT_MARKER",
+                       "UNIQUE_USER_MARKER"):
+            self.assertEqual(record.count(marker), 1,
+                             f"{marker} shown {record.count(marker)} times")
+
+    def _clear_rolling(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["at"] = 0.0
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
 
     def test_record_replaced_on_each_call(self):
         first = mock.MagicMock()
@@ -6031,6 +6058,100 @@ class TestTheAskersOwnProfile(unittest.TestCase):
         system = self._system_for("alice", "what is a bagpipe",
                                   llmbot_core.MODE_FACTUAL)
         self.assertNotIn("bagpipes badly", system)
+
+
+class TestRecallIsNotDilutedByTheRoom(unittest.TestCase):
+    """What was asked must not be drowned by what the room happened to say.
+
+    The query was the question plus the last few channel lines, so recall could
+    "follow the conversation". But `ideal` -- the normaliser the relevance
+    floor is a fraction of -- is the sum of IDF over every query term, so each
+    trailing line raises the bar for the question itself. Measured against the
+    real 2026-line log, asking "is probe fat" in a channel that had moved on:
+    the question alone gave 3 discriminating terms, ideal 12.11 and 17 lines
+    recalled; the question plus three unrelated trailing lines gave 22 terms,
+    ideal 111.01 and NOTHING. There were 34 lines about it in the log.
+
+    The two jobs are split now: the question is one search, the conversation is
+    another, each normalised against its own query, and the question is served
+    first.
+    """
+
+    def setUp(self):
+        self._was = llmbot_core.RECALL_ENABLED
+        llmbot_core.RECALL_ENABLED = True
+        with llmbot_core._prompt_lock:
+            llmbot_core._recall_store = recall.RecallStore(5000)
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        llmbot_core.RECALL_ENABLED = self._was
+        with llmbot_core._prompt_lock:
+            llmbot_core._recall_store = recall.RecallStore(5000)
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+
+    def _build(self):
+        """A log where the answer is old and the room has since moved on."""
+        now = time.time()
+        store = llmbot_core._recall_store
+        store.add("dflatline", "probe is enormously fat and we all know it",
+                  at=now - 3 * 86400)
+        store.add("dflatline", "big fat probe, down the street to get his jeans on",
+                  at=now - 3 * 86400 + 60)
+        # Every chatter line is a one-off, which is what real chat looks like
+        # and what makes this bite: a word said once has df=1, so it survives
+        # _discriminating and adds its full IDF to `ideal`. Repeating one
+        # sentence instead would make its words common enough to be thrown out,
+        # and the dilution would not reproduce.
+        def chatter(i):
+            return " ".join(f"w{i}x{j}" for j in range(8))
+        for i in range(300):
+            store.add(["bananas", "dflatline"][i % 2], chatter(i),
+                      at=now - 86400 + i * 60)
+        # The recent buffer is ALSO in the log, because capture records every
+        # line. That is the whole shape of the bug: those lines are in the
+        # index, so their rare words count towards `ideal`, while the `before`
+        # cutoff keeps them out of the pool, so nothing can ever match them
+        # back. They raise the bar and cannot clear it.
+        with llmbot_core._prompt_lock:
+            for i in range(300, 360):
+                at = now - 3600 + (i - 300) * 30
+                store.add("bananas", chatter(i), at=at)
+                llmbot_core._recent_senders.append("bananas")
+                llmbot_core._recent_lines.append(chatter(i))
+                llmbot_core._recent_times.append(at)
+
+    def test_the_question_is_answered_though_the_room_moved_on(self):
+        self._build()
+        block = llmbot_core._recall_section(
+            "phloid: is probe fat",
+            list(llmbot_core._recent_senders), list(llmbot_core._recent_lines),
+            list(llmbot_core._recent_times), asker="phloid")
+        self.assertIn("fat", block)
+
+    def test_the_conversation_is_still_followed_when_the_question_is_vague(self):
+        # The reason the trailing lines were in the query at all: a follow-up
+        # with no content of its own ("what do you reckon") should still reach
+        # what the room is actually talking about.
+        now = time.time()
+        store = llmbot_core._recall_store
+        store.add("alice", "exiftool renames photos in one line", at=now - 5 * 86400)
+        with llmbot_core._prompt_lock:
+            for i in range(60):
+                llmbot_core._recent_senders.append("alice")
+                llmbot_core._recent_lines.append(
+                    "the exiftool photo renaming thing again")
+                llmbot_core._recent_times.append(now - 3600 + i * 30)
+        block = llmbot_core._recall_section(
+            "phloid: what do you reckon",
+            list(llmbot_core._recent_senders), list(llmbot_core._recent_lines),
+            list(llmbot_core._recent_times), asker="phloid")
+        self.assertIn("exiftool", block)
 
 
 class TestContextTimestamps(unittest.TestCase):
