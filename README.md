@@ -1,6 +1,6 @@
 # sloppy
 
-**v0.7.4**
+**v0.7.5**
 
 Sloppy is a sarcastic, moody and sometimes funny AI bot for IRC. It connects to a local LLM through llama.cpp and brings a unique flavour of awkward crude humor and genuinely useful features. It understands the chat and has persistent context, making it able to chime in or roast people based on things they said earlier.
 
@@ -11,6 +11,10 @@ Works with any LLM running under llama.cpp. The better the model, the better the
 - Moods that randomly change to defined moods, duration of each mood can be set in config
 - A rolling summary of the chat is kept to give the bot contextual awareness
 - Optional logging with pattern matching relevancy calculation for longterm context
+- Answers whoever addressed it, and knows who they are: the person asking and anyone
+  they ask about arrive with their own past lines, so a reply lands on them specifically
+- Can be asked what somebody said and when they said it -- "what did alice say about her
+  boyfriend last week", "when did i say i was going to amsterdam" -- answered from the log
 - Privacy commands allow people to ask what the bot knows about them and make them forget
 - "FactCheck, Serious, Research, Science" and similar terms will make the bot respond seriously
 - !image <url> analyzes an image and describes the content

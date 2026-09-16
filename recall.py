@@ -92,9 +92,26 @@ class Settings:
     # does not need re-tuning as the log grows. See RecallStore._ideal.
     min_relevance: float = 0.3
     # Weeks, not days: halving daily put anything older than the recent-line
-    # buffer out of reach, which is what this exists to reach.
+    # buffer out of reach, which is what this exists to reach. Zero turns the
+    # recency prior OFF, for a question about the past: "when did i say i was
+    # going to amsterdam" wants the answer however old it is, and at any
+    # half-life a two-hundred-day-old line is decayed under the floor.
     half_life_days: float = 14.0
     passages: int = 3
+    # Answer with the EARLIEST lines rather than the best-matching ones, for
+    # "what is the first thing you remember about alice". It sits here beside
+    # half_life_days because both say how to rank rather than what to look for.
+    oldest: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class _Query:
+    """One search, reduced to what scoring needs: the terms worth matching,
+    what a perfect one-line match would score, and whose lines to look at."""
+
+    wanted: set
+    ideal: float
+    theirs: set
 
 
 class RecallStore:
@@ -243,6 +260,7 @@ class RecallStore:
         *,
         before: float | None = None,
         now: float | None = None,
+        nicks: list[str] | None = None,
     ) -> list[list[dict[str, Any]]]:
         """The passages worth showing the model, best first, or [].
 
@@ -263,6 +281,28 @@ class RecallStore:
         as a fraction of the best a single line could score for this query (see
         _ideal): an interjection with no earlier context is fine, one dragging
         in an unrelated argument from Tuesday is worse than useless.
+
+        `nicks` narrows the search to what those people said, which is how
+        anybody asks about somebody: "what did alice say about her boyfriend".
+        A filter rather than an indexed term, deliberately. As a term a nick
+        behaves badly exactly where it matters -- somebody worth asking about
+        is somebody who talks, and a term in thousands of lines has an IDF near
+        zero, so score/ideal approaches 1 for their whole back catalogue and
+        any message naming them floods the prompt. It would also add a term to
+        every record, moving avgdl and every other IDF, and the floor above is
+        calibrated against the index without it. Lines where OTHER people said
+        "alice" carry the word in their text and are found either way.
+
+        Scoped to a person and asked nothing else distinctive ("what did alice
+        say"), it falls back to their most recent lines, because that is the
+        only sensible reading of the question.
+
+        `Settings.oldest` answers a different question altogether -- "what is the first
+        thing you remember about alice" -- with the earliest lines rather than
+        the best-matching ones. Term scoring is skipped for it on purpose: the
+        words in "whats your earliest memory of dflatline" describe the kind of
+        answer wanted, not its subject, and matching them finds lines ABOUT
+        memory instead of the first thing dflatline said.
         """
         settings = Settings() if settings is None else settings
         # The log is chronological, so a time cutoff is a prefix and the pool's
@@ -273,31 +313,71 @@ class RecallStore:
         pool = self._lines[:end]
         if not pool:
             return []
+        theirs = {n.lower() for n in nicks} if nicks else set()
+        if settings.oldest:
+            return self._earliest_from(pool, theirs, settings)
         wanted = self._discriminating(terms(query))
         ideal = self._ideal(wanted) if wanted else 0.0
         if not ideal:
-            return []
-        avgdl = (self._total_terms / len(self._lines)) or 1.0
-        now = time.time() if now is None else now
-        scored = []
-        for i, record in enumerate(pool):
-            score = self._bm25(record, wanted, avgdl)
-            if not score:
-                continue
-            # Last night beats last month at equal term overlap. A half-life
-            # in weeks, not the day it started as: halving daily put anything
-            # older than the recent-line buffer out of reach, which is the
-            # whole thing this is for.
-            age_days = max(0.0, (now - record["at"]) / 86400)
-            relevance = (
-                (score / ideal) * 0.5 ** (age_days / settings.half_life_days)
-            )
-            if relevance >= settings.min_relevance:
-                scored.append((relevance, i))
+            # Nothing distinctive was asked. With a person named that is still
+            # a question -- "what did alice say" -- answered with the last
+            # thing they said; without one there is nothing to look for.
+            return self._latest_from(pool, theirs, settings) if theirs else []
+        scored = self._score(pool, _Query(wanted, ideal, theirs), settings, now)
         if not scored:
             return []
         scored.sort(reverse=True)
         return self._passages([i for _, i in scored], settings.passages)
+
+    def _score(self, pool: list, query: _Query, settings: Settings,
+               now: float | None) -> list:
+        """(relevance, index) for every line above the floor, unordered."""
+        avgdl = (self._total_terms / len(self._lines)) or 1.0
+        now = time.time() if now is None else now
+        scored = []
+        for i, record in enumerate(pool):
+            if query.theirs and record["nick"].lower() not in query.theirs:
+                continue
+            score = self._bm25(record, query.wanted, avgdl)
+            if not score:
+                continue
+            relevance = ((score / query.ideal)
+                         * self._decay(record, settings, now))
+            if relevance >= settings.min_relevance:
+                scored.append((relevance, i))
+        return scored
+
+    @staticmethod
+    def _decay(record: dict[str, Any], settings: Settings, now: float) -> float:
+        """How much age counts against a line.
+
+        Last night beats last month at equal term overlap. A half-life in
+        weeks, not the day it started as: halving daily put anything older than
+        the recent-line buffer out of reach, which is the whole thing this is
+        for. Zero is off, for a question about the past -- see Settings.
+        """
+        if settings.half_life_days <= 0:
+            return 1.0
+        age_days = max(0.0, (now - record["at"]) / 86400)
+        return 0.5 ** (age_days / settings.half_life_days)
+
+    def _earliest_from(self, pool: list, theirs: set,
+                       settings: Settings) -> list[list[dict[str, Any]]]:
+        """The first lines `theirs` said, as passages, or the log's if empty."""
+        hits = [i for i, r in enumerate(pool)
+                if not theirs or r["nick"].lower() in theirs][:settings.passages]
+        return self._passages(hits, settings.passages)
+
+    def _latest_from(self, pool: list, theirs: set,
+                     settings: Settings) -> list[list[dict[str, Any]]]:
+        """The last few things `theirs` said, as passages, or [].
+
+        For a question that names a person and asks nothing else: the newest
+        lines are the only defensible answer to "what did alice say".
+        """
+        hits = [i for i, r in enumerate(pool)
+                if r["nick"].lower() in theirs][-settings.passages:]
+        return self._passages(list(reversed(hits)), settings.passages)
 
     def _passages(self, hits: list[int], limit: int) -> list[list[dict[str, Any]]]:
         """Hit indices as merged, in-order passages of up to `limit` passages.

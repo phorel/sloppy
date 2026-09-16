@@ -441,6 +441,16 @@ summary_max_chars = 4000
 recent_lines = 250
 context_lines = 50
 
+# When somebody asks the bot ABOUT a person -- "what do you think about probe"
+# -- that person's own stored lines ride along, so the answer is about them
+# rather than about an invented version of them. How many lines each, and how
+# many people one question may drag in.
+about_lines = 6
+about_nicks = 2
+# A nick shorter than this is too likely to be an ordinary word for a match in
+# a sentence to mean somebody is being asked about.
+about_min_nick = 3
+
 # Lines shorter than this many characters, or a single word, are treated as
 # noise and kept out of the recent-history buffer and the summary.
 min_chat_chars = 7

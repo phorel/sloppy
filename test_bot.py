@@ -881,13 +881,12 @@ class TestDirectiveModes(unittest.TestCase):
 
     def test_directive_modes_are_context_free(self):
         """Like factual, the directive modes answer about the world, not the
-        people in the room, so the userlist is not woven into their prompt."""
+        people in the room, so nobody is named at them."""
         for mode in (llmbot_core.MODE_SCIENCE, llmbot_core.MODE_RESEARCH,
                      llmbot_core.MODE_ANSWER):
             with self.subTest(mode=mode):
                 self.assertEqual(
-                    llmbot_core._system_context(mode),
-                    llmbot_core._system_prompt(mode))
+                    llmbot_core._addressing_section(mode, "alice"), "")
 
     def test_directive_mode_survives_the_pending_queue(self):
         """The directive mode captured by the receiver must reach the LLM call."""
@@ -2046,7 +2045,7 @@ class TestLLMCallDebugRecord(unittest.TestCase):
             llmbot_core._recent_lines.clear()
             llmbot_core._recent_senders.clear()
 
-    def test_call_records_system_prompt_messages_user_and_output(self):
+    def test_call_records_every_message_and_the_output(self):
         user_prompt = "what is 2+2?"
         mock_response = mock.MagicMock()
         mock_response.choices = [mock.MagicMock()]
@@ -2061,18 +2060,45 @@ class TestLLMCallDebugRecord(unittest.TestCase):
         self.assertEqual(result, "The answer is 42.")
         messages = mock_create.call_args.kwargs["messages"]
         record = llmbot_core.get_last_llm_call()
-        # system prompt, shown on its own
-        self.assertIn("[System prompt]", record)
-        self.assertIn(messages[0]["content"], record)
-        # messages verbatim, in the same format they were sent to the model
-        self.assertIn("[Messages]", record)
-        self.assertIn(repr(messages), record)
-        # the user prompt, shown on its own
-        self.assertIn("[User message]", record)
-        self.assertIn(user_prompt, record)
-        # the returned output
-        self.assertIn("[Output]", record)
+        self.assertIn(f"{len(messages)} messages sent", record)
+        for message in messages:
+            self.assertIn(f"[{message['role']}]", record)
+            self.assertIn(message["content"], record)
+        self.assertIn("[output]", record)
         self.assertIn("The answer is 42.", record)
+
+    def test_nothing_is_shown_twice(self):
+        # The record used to print the system message, then repr(messages)
+        # which contains it again, then the user message a second time too.
+        # Nothing was ever SENT twice -- but the one screen somebody opens to
+        # check that said otherwise, which cost a real investigation.
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = "UNIQUE_SUMMARY_MARKER"
+            llmbot_core._rolling["at"] = time.time() - 60
+            llmbot_core._recent_senders.append("alice")
+            llmbot_core._recent_lines.append("UNIQUE_CHAT_MARKER")
+            llmbot_core._recent_times.append(time.time() - 60)
+        self.addCleanup(self._clear_rolling)
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "ok"
+        response.choices[0].finish_reason = "stop"
+        with mock.patch.object(llmbot_core._llm_client.chat.completions,
+                               "create", return_value=response):
+            llmbot_core._call_llm("UNIQUE_USER_MARKER")
+        record = llmbot_core.get_last_llm_call()
+        for marker in ("UNIQUE_SUMMARY_MARKER", "UNIQUE_CHAT_MARKER",
+                       "UNIQUE_USER_MARKER"):
+            self.assertEqual(record.count(marker), 1,
+                             f"{marker} shown {record.count(marker)} times")
+
+    def _clear_rolling(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["at"] = 0.0
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
 
     def test_record_replaced_on_each_call(self):
         first = mock.MagicMock()
@@ -5538,6 +5564,689 @@ class TestPromptPrefixIsStable(unittest.TestCase):
         self.assertIn("1 hour", block)
 
 
+class TestTheReplyKnowsWhoIsAsking(unittest.TestCase):
+    """The model must be told who it is answering, not left to infer it.
+
+    Reported live: somebody addresses the bot and it answers a different person
+    or talks about one. Measured against the live model on the real prompt
+    path: 1/19 replies named somebody other than the asker when the question
+    was still the last line in the channel, and 5/20 once two other people had
+    spoken after it -- because the only thing marking the asker was that their
+    line happened to be last, and it stops being last as soon as anybody types.
+
+    Every other line the model reads is attributed "nick: text"; the one line
+    it is supposed to answer was the only anonymous thing in the prompt.
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(["alice", "bob", "carol"])
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+
+    def _said(self, sender, text):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.append(sender)
+            llmbot_core._recent_lines.append(text)
+            llmbot_core._recent_times.append(time.time())
+
+    def _sent(self, prompt, mode=None, asker="alice"):
+        """The messages one call would send, with the model stubbed out."""
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        with mock.patch.object(llmbot_core._llm_client.chat.completions,
+                               "create", return_value=response) as create:
+            llmbot_core._call_llm(prompt, mode or llmbot_core.MODE_CHAT,
+                                  asker=asker)
+        return create.call_args.kwargs["messages"]
+
+    def _asked_in_the_channel(self, sender, text):
+        """The messages a real line from `sender` produces, end to end.
+
+        From the socket line through the poll loop rather than from _call_llm,
+        because the bug was in the plumbing between them: the sender was known
+        at the top and gone by the time the model was called. The mood is
+        pinned because a scheduled one swaps the persona mid-test, and this is
+        about who gets answered rather than in which voice.
+        """
+        sock = mock.MagicMock(spec=socket.socket)
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        llmbot_core._handle_line(
+            sock, f":{sender}!u@h PRIVMSG {llmbot_core.CHANNEL} :{text}")
+        with (mock.patch.object(llmbot_core._llm_client.chat.completions,
+                                "create", return_value=response) as create,
+              mock.patch.object(llmbot_core, "_effective_mode",
+                                side_effect=lambda mode: mode)):
+            llmbot_core._process_pending(sock)
+        return create.call_args.kwargs["messages"]
+
+    def test_the_prompt_names_the_person_being_answered(self):
+        # Two people speak after the question, which is the ordinary case: a
+        # reply takes seconds and nobody stops typing while it is generated.
+        sock = mock.MagicMock(spec=socket.socket)
+        llmbot_core._handle_line(
+            sock,
+            f":alice!u@h PRIVMSG {llmbot_core.CHANNEL} "
+            ":sloppy is it worth upgrading")
+        self._said("bob", "carol did you see that")
+        self._said("carol", "bob yeah just now")
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        with (mock.patch.object(llmbot_core._llm_client.chat.completions,
+                                "create", return_value=response) as create,
+              mock.patch.object(llmbot_core, "_effective_mode",
+                                side_effect=lambda mode: mode)):
+            llmbot_core._process_pending(sock)
+        system = create.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("alice", system.rsplit("--- NOW ---", 1)[1])
+        self.assertNotIn("bob", system.rsplit("--- NOW ---", 1)[1].split(
+            "The other people here are")[0])
+
+    def test_the_question_reaches_the_model_attributed(self):
+        # The one line the model has to answer used to be the only anonymous
+        # thing in a prompt where every other line said who said it.
+        messages = self._asked_in_the_channel(
+            "alice", "sloppy is it worth upgrading")
+        self.assertEqual(messages[1]["content"],
+                         "alice: is it worth upgrading")
+
+    def test_who_is_asking_is_said_below_the_chat_not_above_it(self):
+        # It describes this message, so it belongs with the rest of the
+        # current turn rather than three thousand characters above the chat it
+        # refers to. This extends TestPromptPrefixIsStable to the FULL system
+        # message rather than to _context_block alone: the persona and the
+        # memory must still be byte-identical when a different person speaks.
+        # (It is not worth prompt-cache time -- measured, the sliding chat
+        # window invalidates that region every message anyway. See
+        # _addressing_section.)
+        first = self._asked_in_the_channel(
+            "alice", "sloppy is it worth upgrading")[0]["content"]
+        second = self._asked_in_the_channel(
+            "bob", "sloppy what do you think")[0]["content"]
+        shared = os.path.commonprefix([first, second])
+        self.assertIn("--- RECENT IRC CHAT ---", shared)
+        self.assertIn("alice: sloppy is it worth upgrading", shared)
+
+    def test_the_modes_that_answer_about_the_world_are_not_told_who_asked(self):
+        # Nobody asking what a page says needs to be told who is in the room;
+        # the mention list once turned a page summary into "probe alice, the
+        # page is...".
+        self._said("alice", "sloppy summarise this")
+        for mode in (llmbot_core.MODE_WEBPAGE, llmbot_core.MODE_FACTUAL,
+                     llmbot_core.MODE_TRANSLATE):
+            with self.subTest(mode=mode):
+                messages = self._sent("what does it say", mode)
+                self.assertNotIn("talking to you", messages[0]["content"])
+
+    def test_a_question_about_the_world_is_not_attributed_either(self):
+        # "!quote gandhi" asks for a quote from Gandhi, not from alice.
+        messages = self._asked_in_the_channel("alice", "!quote gandhi")
+        self.assertEqual(messages[1]["content"], "gandhi")
+
+    def test_an_unprompted_line_names_nobody_in_particular(self):
+        # An interjection has no asker: nobody addressed the bot, so there is
+        # no one person to answer.
+        self._said("alice", "the boiler is making a noise")
+        system = self._sent("say something about the boiler",
+                            llmbot_core.MODE_INTERJECT, asker="")[0]["content"]
+        self.assertNotIn("talking to you", system)
+
+
+class TestBeingAskedAboutSomebody(unittest.TestCase):
+    """Asked about a third party, the bot answers about that third party.
+
+    "sloppy what do you think about probe" is ordinary channel traffic and the
+    reply is only funny if it is specific, so the person being ASKED ABOUT has
+    to reach the prompt as well as the person asking. Two things stopped it:
+    nothing ever injected a profile outside a greeting, and recall indexes only
+    a line's text, so searching a nick could not find what that nick had said.
+
+    Measured against the live model with probe's lines aged out of the recent
+    buffer -- in his profile and the log, where a real channel keeps them --
+    3 of 12 replies used anything probe had actually said. The other nine
+    invented him, including "probe is a good dog" and "he's just a wrapper
+    around a rest api".
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(["alice", "bob", "probe"])
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+
+    def _probe_said(self, *lines):
+        old = time.time() - 86400 * 3
+        with llmbot_core._prompt_lock:
+            for i, line in enumerate(lines):
+                llmbot_core._profile_store.note_line("probe", line,
+                                                     now=old + i * 60)
+
+    def _system_for(self, asker, text):
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        with mock.patch.object(llmbot_core._llm_client.chat.completions,
+                               "create", return_value=response) as create:
+            llmbot_core._call_llm(llmbot_core._attributed(asker, text),
+                                  llmbot_core.MODE_CHAT, asker=asker)
+        return create.call_args.kwargs["messages"][0]["content"]
+
+    def test_their_own_words_reach_the_prompt(self):
+        self._probe_said("i have eleven mechanical keyboards",
+                         "my server hit 94 degrees in the airing cupboard")
+        system = self._system_for("alice", "what do you think about probe")
+        self.assertIn("eleven mechanical keyboards", system)
+        self.assertIn("airing cupboard", system)
+
+    def test_the_prompt_says_the_answer_is_about_them(self):
+        self._probe_said("i only eat beige food")
+        system = self._system_for("alice", "is probe fat")
+        tail = system.rsplit("--- NOW ---", 1)[1]
+        self.assertIn("asking about probe", tail)
+        self.assertIn("alice", tail)
+
+    def test_nobody_named_leaves_the_prompt_as_it_was(self):
+        self._probe_said("i only eat beige food")
+        system = self._system_for("alice", "what is for dinner")
+        self.assertNotIn("beige food", system)
+
+    def test_the_asker_is_not_treated_as_the_subject(self):
+        # "alice: what do you think" names alice, as every attributed line
+        # does. She is who is asking, not who is being asked about -- so the
+        # prompt must not say the answer is ABOUT her. Her own profile is in
+        # there regardless (see TestTheAskersOwnProfile); the two are different
+        # jobs and this is the one that decides what the reply is for.
+        self._probe_said("i only eat beige food")
+        self.assertEqual(
+            llmbot_core._named_others("alice: what do you think", "alice"), [])
+        system = self._system_for("alice", "what do you think")
+        self.assertNotIn("asking about alice", system)
+
+    def test_a_nick_too_short_to_tell_from_a_word_is_not_a_subject(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._users["names"].append("so")
+            llmbot_core._profile_store.note_line("so", "i am a real person")
+        self.assertEqual(
+            llmbot_core._named_others("alice: is it so bad", "alice"), [])
+
+    def test_recall_still_covers_what_was_said_ABOUT_them(self):
+        # The two halves are deliberately split. The profile holds what probe
+        # said; the log holds what the channel said about probe, which it finds
+        # because those lines contain the word. Indexing the nick itself was
+        # considered and rejected: it adds a term to every record, which moves
+        # avgdl and every IDF, and recall's floor is calibrated against the
+        # index as it stands.
+        store = recall.RecallStore(100)
+        store.add("bob", "probe put his server in the airing cupboard")
+        store.add("carol", "the deploy fell over again")
+        hits = store.search("what do you think about probe",
+                            recall.Settings(min_relevance=0.1))
+        found = [r["text"] for passage in hits for r in passage]
+        self.assertIn("probe put his server in the airing cupboard", found)
+
+
+class TestRecallByPerson(unittest.TestCase):
+    """Recall can be asked what a particular person said.
+
+    "what did alice say about her boyfriend last week" and "when did i say i
+    was going to amsterdam" are the questions this is for, and the first of
+    them returned nothing: the index is built on a line's TEXT, so alice's own
+    lines carry no trace of her name. Measured before the change --
+    search("what did alice say") found 0 of her 2 lines.
+
+    Scoped by FILTER rather than by indexing the nick as a term. As a term, a
+    chatty person's nick has a near-zero IDF, so score/ideal approaches 1 for
+    every line they ever wrote and any ordinary message naming somebody floods
+    recall with their back catalogue. A filter gets the same answer without
+    touching avgdl, the IDF of anything else, or the calibrated floor -- and
+    lines where OTHER people said "alice" are found by the text index already.
+    """
+
+    DAY = 86400
+
+    def _store(self):
+        store = recall.RecallStore(1000)
+        now = time.time()
+        store.add("alice", "my boyfriend keeps leaving socks on the radiator",
+                  at=now - 7 * self.DAY)
+        store.add("alice", "honestly i think im going to dump him",
+                  at=now - 7 * self.DAY + 60)
+        store.add("bob", "my boyfriend is lovely actually",
+                  at=now - 6 * self.DAY)
+        store.add("phloid", "im going to amsterdam in october for a conference",
+                  at=now - 200 * self.DAY)
+        for i in range(200):
+            store.add(["bob", "carol"][i % 2],
+                      f"the staging deploy fell over again number {i}",
+                      at=now - (i % 20) * self.DAY)
+        return store
+
+    def _texts(self, hits):
+        return [r["text"] for passage in hits for r in passage]
+
+    def test_a_person_with_nothing_else_to_go_on_is_found_by_name(self):
+        # "what did alice say" has no distinctive term but her name.
+        hits = self._store().search("what did alice say",
+                                    recall.Settings(), nicks=["alice"])
+        self.assertTrue(self._texts(hits),
+                        "asking what a person said found nothing")
+
+    def test_the_scope_keeps_other_peoples_lines_out(self):
+        hits = self._store().search("what did alice say about her boyfriend",
+                                    recall.Settings(), nicks=["alice"])
+        found = self._texts(hits)
+        self.assertIn("my boyfriend keeps leaving socks on the radiator", found)
+        self.assertNotIn("my boyfriend is lovely actually", found)
+
+    def test_naming_nobody_searches_the_whole_log_as_before(self):
+        store = self._store()
+        settings = recall.Settings()
+        self.assertEqual(
+            self._texts(store.search("boyfriend socks radiator", settings)),
+            self._texts(store.search("boyfriend socks radiator", settings,
+                                     nicks=[])),
+        )
+
+    def test_something_said_long_ago_is_still_reachable(self):
+        # The recency prior is right for "what were we just arguing about" and
+        # wrong for "when did i say i was going to amsterdam" -- 200 days of
+        # halving puts the answer under the floor. A question about the past
+        # turns the decay off.
+        store = self._store()
+        decayed = store.search("amsterdam", recall.Settings())
+        self.assertNotIn(
+            "im going to amsterdam in october for a conference",
+            self._texts(decayed))
+        undecayed = store.search("amsterdam",
+                                 recall.Settings(half_life_days=0))
+        self.assertIn("im going to amsterdam in october for a conference",
+                      self._texts(undecayed))
+
+
+class TestAskingAboutThePast(unittest.TestCase):
+    """The bot is asked when something was said, and can answer.
+
+    Every recalled line already carries its date, so the material is there;
+    what was missing was reaching it -- the question has to scope to the right
+    person and stop the recency prior burying an old answer.
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(["alice", "phloid"])
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._recall_store = recall.RecallStore(1000)
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+        self._recall_was = llmbot_core.RECALL_ENABLED
+        llmbot_core.RECALL_ENABLED = True
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        llmbot_core.RECALL_ENABLED = self._recall_was
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._recall_store = recall.RecallStore(1000)
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+
+    def _logged(self, nick, text, days_ago):
+        at = time.time() - days_ago * 86400
+        with llmbot_core._prompt_lock:
+            llmbot_core._recall_store.add(nick, text, at=at)
+
+    def _system_for(self, asker, text):
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        with mock.patch.object(llmbot_core._llm_client.chat.completions,
+                               "create", return_value=response) as create:
+            llmbot_core._call_llm(llmbot_core._attributed(asker, text),
+                                  llmbot_core.MODE_CHAT, asker=asker)
+        return create.call_args.kwargs["messages"][0]["content"]
+
+    def test_what_did_someone_say_about_a_thing(self):
+        self._logged("alice", "my boyfriend keeps leaving socks everywhere", 7)
+        self._logged("bob", "the deploy fell over again", 1)
+        system = self._system_for(
+            "phloid", "what did alice say about her boyfriend last week")
+        self.assertIn("leaving socks everywhere", system)
+
+    def test_when_did_i_say_resolves_to_the_person_asking(self):
+        self._logged("phloid", "im going to amsterdam in october", 200)
+        self._logged("carol", "anyway the kettle broke again", 199)
+        self._logged("alice", "im going to berlin in october", 198)
+        system = self._system_for(
+            "phloid", "when did i say i was going to amsterdam")
+        self.assertIn("im going to amsterdam in october", system)
+        # alice said the same shape of thing and is not who asked. Separated by
+        # a line in the log on purpose: a hit brings its neighbours with it,
+        # which is deliberate (recall._passages), so adjacency would prove
+        # nothing about the scoping either way.
+        self.assertNotIn("berlin", system)
+
+    def test_the_askers_own_log_is_searched_for_what_they_asked(self):
+        # Their profile holds their last few lines whatever the subject. This
+        # is the older line that happens to be about what they are asking now,
+        # which no fixed window of recent lines can hold.
+        self._logged("phloid", "my espresso machine leaks from the group head",
+                     120)
+        for i in range(60):
+            self._logged("alice", f"unrelated chatter number {i}", 30)
+        system = self._system_for("phloid", "should i descale the machine")
+        self.assertIn("leaks from the group head", system)
+
+    def test_a_recalled_line_says_when_it_was_said(self):
+        self._logged("phloid", "im going to amsterdam in october", 200)
+        system = self._system_for(
+            "phloid", "when did i say i was going to amsterdam")
+        earlier = system.split("EARLIER IN THE CHANNEL", 1)[1]
+        # A date, so the model can answer "when" rather than guess.
+        self.assertRegex(earlier.split("\n")[1], r"\[\w+ \d+ \w+ \d{4}")
+
+
+class TestTheAskersOwnProfile(unittest.TestCase):
+    """Who the bot is talking to, in their own words, on every direct reply.
+
+    Asked about somebody else the bot gets their profile; it should know as
+    much about the person actually talking to it, which is what lets a reply
+    land on them rather than on anybody.
+    """
+
+    def setUp(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._users["names"].extend(["alice", "probe"])
+            llmbot_core._rolling["summary"] = ""
+            llmbot_core._rolling["highlights"] = []
+            llmbot_core._rolling["at"] = 0.0
+            llmbot_core._profile_store = profiles.ProfileStore()
+            llmbot_core._conversation.update(
+                {"nick": "", "deadline": 0.0, "budget": 0, "at": 0.0})
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._users["names"].clear()
+            llmbot_core._profile_store = profiles.ProfileStore()
+
+    def _system_for(self, asker, text, mode=None):
+        response = mock.MagicMock()
+        response.choices = [mock.MagicMock()]
+        response.choices[0].message.content = "sure"
+        with mock.patch.object(llmbot_core._llm_client.chat.completions,
+                               "create", return_value=response) as create:
+            llmbot_core._call_llm(llmbot_core._attributed(asker, text),
+                                  mode or llmbot_core.MODE_CHAT, asker=asker)
+        return create.call_args.kwargs["messages"][0]["content"]
+
+    def test_the_asker_gets_their_own_profile(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store.note_line(
+                "alice", "i have been learning the bagpipes badly")
+        system = self._system_for("alice", "what should i do this weekend")
+        self.assertIn("bagpipes", system)
+
+    def test_an_unprompted_line_pulls_nobody_in(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store.note_line(
+                "alice", "i have been learning the bagpipes badly")
+        system = self._system_for("", "say something about the weather",
+                                  llmbot_core.MODE_INTERJECT)
+        self.assertNotIn("bagpipes", system)
+
+    def test_the_modes_that_answer_about_the_world_get_no_profiles(self):
+        with llmbot_core._prompt_lock:
+            llmbot_core._profile_store.note_line(
+                "alice", "i have been learning the bagpipes badly")
+        system = self._system_for("alice", "what is a bagpipe",
+                                  llmbot_core.MODE_FACTUAL)
+        self.assertNotIn("bagpipes badly", system)
+
+
+class TestRecallIsNotDilutedByTheRoom(unittest.TestCase):
+    """What was asked must not be drowned by what the room happened to say.
+
+    The query was the question plus the last few channel lines, so recall could
+    "follow the conversation". But `ideal` -- the normaliser the relevance
+    floor is a fraction of -- is the sum of IDF over every query term, so each
+    trailing line raises the bar for the question itself. Measured against the
+    real 2026-line log, asking "is probe fat" in a channel that had moved on:
+    the question alone gave 3 discriminating terms, ideal 12.11 and 17 lines
+    recalled; the question plus three unrelated trailing lines gave 22 terms,
+    ideal 111.01 and NOTHING. There were 34 lines about it in the log.
+
+    The two jobs are split now: the question is one search, the conversation is
+    another, each normalised against its own query, and the question is served
+    first.
+    """
+
+    def setUp(self):
+        self._was = llmbot_core.RECALL_ENABLED
+        llmbot_core.RECALL_ENABLED = True
+        with llmbot_core._prompt_lock:
+            llmbot_core._recall_store = recall.RecallStore(5000)
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+        self.addCleanup(self._clear)
+
+    def _clear(self):
+        llmbot_core.RECALL_ENABLED = self._was
+        with llmbot_core._prompt_lock:
+            llmbot_core._recall_store = recall.RecallStore(5000)
+            llmbot_core._recent_senders.clear()
+            llmbot_core._recent_lines.clear()
+            llmbot_core._recent_times.clear()
+
+    def _build(self):
+        """A log where the answer is old and the room has since moved on."""
+        now = time.time()
+        store = llmbot_core._recall_store
+        store.add("dflatline", "probe is enormously fat and we all know it",
+                  at=now - 3 * 86400)
+        store.add("dflatline", "big fat probe, down the street to get his jeans on",
+                  at=now - 3 * 86400 + 60)
+        # Every chatter line is a one-off, which is what real chat looks like
+        # and what makes this bite: a word said once has df=1, so it survives
+        # _discriminating and adds its full IDF to `ideal`. Repeating one
+        # sentence instead would make its words common enough to be thrown out,
+        # and the dilution would not reproduce.
+        def chatter(i):
+            return " ".join(f"w{i}x{j}" for j in range(8))
+        for i in range(300):
+            store.add(["bananas", "dflatline"][i % 2], chatter(i),
+                      at=now - 86400 + i * 60)
+        # The recent buffer is ALSO in the log, because capture records every
+        # line. That is the whole shape of the bug: those lines are in the
+        # index, so their rare words count towards `ideal`, while the `before`
+        # cutoff keeps them out of the pool, so nothing can ever match them
+        # back. They raise the bar and cannot clear it.
+        with llmbot_core._prompt_lock:
+            for i in range(300, 360):
+                at = now - 3600 + (i - 300) * 30
+                store.add("bananas", chatter(i), at=at)
+                llmbot_core._recent_senders.append("bananas")
+                llmbot_core._recent_lines.append(chatter(i))
+                llmbot_core._recent_times.append(at)
+
+    def test_the_question_is_answered_though_the_room_moved_on(self):
+        self._build()
+        block = llmbot_core._recall_section(
+            "phloid: is probe fat",
+            list(llmbot_core._recent_senders), list(llmbot_core._recent_lines),
+            list(llmbot_core._recent_times), asker="phloid")
+        self.assertIn("fat", block)
+
+    def test_the_conversation_is_still_followed_when_the_question_is_vague(self):
+        # The reason the trailing lines were in the query at all: a follow-up
+        # with no content of its own ("what do you reckon") should still reach
+        # what the room is actually talking about.
+        now = time.time()
+        store = llmbot_core._recall_store
+        store.add("alice", "exiftool renames photos in one line", at=now - 5 * 86400)
+        with llmbot_core._prompt_lock:
+            for i in range(60):
+                llmbot_core._recent_senders.append("alice")
+                llmbot_core._recent_lines.append(
+                    "the exiftool photo renaming thing again")
+                llmbot_core._recent_times.append(now - 3600 + i * 30)
+        block = llmbot_core._recall_section(
+            "phloid: what do you reckon",
+            list(llmbot_core._recent_senders), list(llmbot_core._recent_lines),
+            list(llmbot_core._recent_times), asker="phloid")
+        self.assertIn("exiftool", block)
+
+
+class TestAskedForTheEarliest(unittest.TestCase):
+    """"whats your earliest memory of dflatline" answers with the earliest one.
+
+    Reported live: asked specifically about old memories, the bot reached for
+    recent ones or just bantered. Two causes, both measured against the real
+    log. The phrasings people actually use were not recognised as questions
+    about the past at all -- 5 of 7 real examples missed, because the pattern
+    had been written from two phrasings somebody invented rather than from the
+    channel. And "earliest" had no meaning to retrieval even once recognised:
+    every search ranks by relevance, so the earliest thing a person said only
+    came back if it happened to be the best term match.
+    """
+
+    PHRASINGS = [
+        "whats your earliest memory of dflatline",
+        "where did spacec0wboy go for his vacation?",
+        "whats the earliest memory you have of me",
+        "what do you remember about probe",
+        "whats your oldest memory of dflatline",
+        "what did alice say last week",
+        "when did i say i was going to amsterdam",
+        "do you remember what probe said about his server",
+        "remember when dflatline lost his chair",
+        "what did probe do yesterday",
+        "whats the first thing i ever said to you",
+        "what do you know about spacec0wboy",
+        "didnt probe used to have a thinkpad",
+        "what did bob say ages ago about rust",
+    ]
+    ORDINARY = [
+        "is probe fat",
+        "what do you think about probe",
+        "hows it going",
+        "sloppy tell me a joke",
+        "what is the capital of france",
+        "should i descale the machine",
+        "whats for dinner",
+        # A follow-up about the conversation, NOT a memory question: the
+        # historical path drops the conversation search, which is the one
+        # thing a follow-up with no content of its own has to go on.
+        "how did that go",
+        "why did it do that",
+    ]
+
+    def test_the_phrasings_people_actually_use_are_recognised(self):
+        for text in self.PHRASINGS:
+            with self.subTest(text=text):
+                self.assertTrue(llmbot_core._asks_about_the_past(text))
+
+    def test_ordinary_chat_is_not(self):
+        for text in self.ORDINARY:
+            with self.subTest(text=text):
+                self.assertFalse(llmbot_core._asks_about_the_past(text))
+
+    def test_earliest_is_recognised_as_its_own_question(self):
+        for text in ("whats your earliest memory of dflatline",
+                     "whats your oldest memory of me",
+                     "whats the first thing i ever said to you"):
+            with self.subTest(text=text):
+                self.assertTrue(llmbot_core._asks_for_the_earliest(text))
+        for text in ("what did alice say last week",
+                     "do you remember what probe said"):
+            with self.subTest(text=text):
+                self.assertFalse(llmbot_core._asks_for_the_earliest(text))
+
+    def test_the_earliest_line_is_what_comes_back(self):
+        store = recall.RecallStore(1000)
+        now = time.time()
+        store.add("dflatline", "THE FIRST THING EVER", at=now - 40 * 86400)
+        for i in range(50):
+            store.add("dflatline", f"something later number {i}",
+                      at=now - 10 * 86400 + i * 60)
+        hits = store.search("whats your earliest memory of dflatline",
+                            recall.Settings(oldest=True), nicks=["dflatline"])
+        found = [r["text"] for passage in hits for r in passage]
+        self.assertIn("THE FIRST THING EVER", found)
+
+    def test_the_earliest_is_theirs_not_just_anybodys(self):
+        store = recall.RecallStore(1000)
+        now = time.time()
+        store.add("bananas", "BANANAS SPOKE FIRST", at=now - 90 * 86400)
+        # Not adjacent: a hit brings its neighbours with it by design
+        # (recall._passages), so touching lines would prove nothing.
+        for i in range(5):
+            store.add("carol", f"filler {i}", at=now - 80 * 86400 + i * 60)
+        store.add("dflatline", "DFLATLINE SPOKE FIRST", at=now - 40 * 86400)
+        hits = store.search("earliest memory of dflatline",
+                            recall.Settings(oldest=True), nicks=["dflatline"])
+        found = [r["text"] for passage in hits for r in passage]
+        self.assertIn("DFLATLINE SPOKE FIRST", found)
+        self.assertNotIn("BANANAS SPOKE FIRST", found)
+
+
 class TestContextTimestamps(unittest.TestCase):
     """The prompt says what time it is, so the bot can tell now from earlier."""
 
@@ -6103,6 +6812,39 @@ class TestMoodTemperature(unittest.TestCase):
         self.addCleanup(lambda: llmbot_core._MOODS.pop("bogus", None))
         llmbot_core._rebuild_moods()
         self.assertNotIn("bogus", llmbot_core.MOOD_TEMPERATURES)
+
+
+class TestCommandAliases(unittest.TestCase):
+    """The short and second names for commands reach the same mode."""
+
+    ALIASES = (
+        ("!tr", "!translate", llmbot_core.MODE_TRANSLATE),
+        ("!fc", "!factcheck", llmbot_core.MODE_FACTUAL),
+        ("!fact", "!factoid", llmbot_core.MODE_FACTOID),
+        ("!define", "!research", llmbot_core.MODE_RESEARCH),
+        ("!explain", "!research", llmbot_core.MODE_RESEARCH),
+    )
+
+    def test_an_alias_reaches_the_same_mode_as_its_command(self):
+        for alias, command, mode in self.ALIASES:
+            with self.subTest(alias=alias):
+                self.assertEqual(llmbot_core.BANG_COMMANDS[alias], mode)
+                self.assertEqual(llmbot_core.BANG_COMMANDS[command], mode)
+
+    def test_an_alias_carries_its_subject(self):
+        self.assertEqual(
+            llmbot_core._match_trigger("!define entropy"),
+            (llmbot_core.MODE_RESEARCH, "entropy"),
+        )
+
+    def test_the_help_lists_an_alias_beside_its_command(self):
+        # _help_lines groups by mode, so an alias shows up next to the command
+        # it aliases with no second place to remember to update.
+        helped = " ".join(llmbot_core._help_lines())
+        for alias, command, _mode in self.ALIASES:
+            with self.subTest(alias=alias):
+                self.assertIn(alias, helped)
+                self.assertIn(command, helped)
 
 
 class TestRecitalCommands(unittest.TestCase):
@@ -8150,9 +8892,15 @@ class TestProfileThreshold(unittest.TestCase):
         )
 
     def test_the_profile_bar_is_the_lax_one(self):
-        # "lol ok" is six characters: under the chat bar, over the profile one.
-        self.assertTrue(llmbot_core._is_trivial_message("lol ok"))
-        self.assertFalse(llmbot_core._too_short_for_profile("lol ok"))
+        # Derived from the two constants rather than written out: a line
+        # between the bars is the whole point of having two, and a hardcoded
+        # example breaks the next time either is retuned in sloppy.toml --
+        # which it has, three times.
+        words = "ab " * llmbot_core.MIN_CHAT_CHARS
+        between = words[:llmbot_core.MIN_CHAT_CHARS - 1].strip()
+        self.assertGreaterEqual(len(between), llmbot_core.MIN_PROFILE_CHARS)
+        self.assertTrue(llmbot_core._is_trivial_message(between))
+        self.assertFalse(llmbot_core._too_short_for_profile(between))
 
     def test_the_profile_bar_has_no_single_word_rule(self):
         # The word rule is what actually blocked "yeah", not the length.
@@ -9735,10 +10483,11 @@ class TestSummarizeDelivery(unittest.TestCase):
             llmbot_core._paused["on"] = False
 
     def test_a_summary_does_not_address_the_room(self):
-        # _system_context adds "mention users about 50% of the time", which
-        # turned a summary into "probe alice, the page is...".
-        prompt = llmbot_core._system_context(llmbot_core.MODE_WEBPAGE)
-        self.assertNotIn("mention users", prompt)
+        # The addressing section names whoever asked and asks for people to be
+        # mentioned, which turned a summary into "probe alice, the page is...".
+        self.assertEqual(
+            llmbot_core._addressing_section(llmbot_core.MODE_WEBPAGE, "alice"),
+            "")
 
     def test_the_summary_gets_more_lines_than_ordinary_chat(self):
         long_text = " ".join(f"word{i}" for i in range(400))
@@ -9959,8 +10708,9 @@ class TestTranslate(unittest.TestCase):
         self.assertIn(f"into {llmbot_core.TRANSLATE_DEFAULT}", prompt)
 
     def test_a_translation_does_not_address_the_room(self):
-        prompt = llmbot_core._system_context(llmbot_core.MODE_TRANSLATE)
-        self.assertNotIn("mention users", prompt)
+        self.assertEqual(
+            llmbot_core._addressing_section(llmbot_core.MODE_TRANSLATE, "alice"),
+            "")
 
     def test_the_request_is_rewritten_before_the_call(self):
         sock = mock.MagicMock(spec=socket.socket)
