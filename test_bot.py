@@ -6154,6 +6154,99 @@ class TestRecallIsNotDilutedByTheRoom(unittest.TestCase):
         self.assertIn("exiftool", block)
 
 
+class TestAskedForTheEarliest(unittest.TestCase):
+    """"whats your earliest memory of dflatline" answers with the earliest one.
+
+    Reported live: asked specifically about old memories, the bot reached for
+    recent ones or just bantered. Two causes, both measured against the real
+    log. The phrasings people actually use were not recognised as questions
+    about the past at all -- 5 of 7 real examples missed, because the pattern
+    had been written from two phrasings somebody invented rather than from the
+    channel. And "earliest" had no meaning to retrieval even once recognised:
+    every search ranks by relevance, so the earliest thing a person said only
+    came back if it happened to be the best term match.
+    """
+
+    PHRASINGS = [
+        "whats your earliest memory of dflatline",
+        "where did spacec0wboy go for his vacation?",
+        "whats the earliest memory you have of me",
+        "what do you remember about probe",
+        "whats your oldest memory of dflatline",
+        "what did alice say last week",
+        "when did i say i was going to amsterdam",
+        "do you remember what probe said about his server",
+        "remember when dflatline lost his chair",
+        "what did probe do yesterday",
+        "whats the first thing i ever said to you",
+        "what do you know about spacec0wboy",
+        "didnt probe used to have a thinkpad",
+        "what did bob say ages ago about rust",
+    ]
+    ORDINARY = [
+        "is probe fat",
+        "what do you think about probe",
+        "hows it going",
+        "sloppy tell me a joke",
+        "what is the capital of france",
+        "should i descale the machine",
+        "whats for dinner",
+        # A follow-up about the conversation, NOT a memory question: the
+        # historical path drops the conversation search, which is the one
+        # thing a follow-up with no content of its own has to go on.
+        "how did that go",
+        "why did it do that",
+    ]
+
+    def test_the_phrasings_people_actually_use_are_recognised(self):
+        for text in self.PHRASINGS:
+            with self.subTest(text=text):
+                self.assertTrue(llmbot_core._asks_about_the_past(text))
+
+    def test_ordinary_chat_is_not(self):
+        for text in self.ORDINARY:
+            with self.subTest(text=text):
+                self.assertFalse(llmbot_core._asks_about_the_past(text))
+
+    def test_earliest_is_recognised_as_its_own_question(self):
+        for text in ("whats your earliest memory of dflatline",
+                     "whats your oldest memory of me",
+                     "whats the first thing i ever said to you"):
+            with self.subTest(text=text):
+                self.assertTrue(llmbot_core._asks_for_the_earliest(text))
+        for text in ("what did alice say last week",
+                     "do you remember what probe said"):
+            with self.subTest(text=text):
+                self.assertFalse(llmbot_core._asks_for_the_earliest(text))
+
+    def test_the_earliest_line_is_what_comes_back(self):
+        store = recall.RecallStore(1000)
+        now = time.time()
+        store.add("dflatline", "THE FIRST THING EVER", at=now - 40 * 86400)
+        for i in range(50):
+            store.add("dflatline", f"something later number {i}",
+                      at=now - 10 * 86400 + i * 60)
+        hits = store.search("whats your earliest memory of dflatline",
+                            recall.Settings(oldest=True), nicks=["dflatline"])
+        found = [r["text"] for passage in hits for r in passage]
+        self.assertIn("THE FIRST THING EVER", found)
+
+    def test_the_earliest_is_theirs_not_just_anybodys(self):
+        store = recall.RecallStore(1000)
+        now = time.time()
+        store.add("bananas", "BANANAS SPOKE FIRST", at=now - 90 * 86400)
+        # Not adjacent: a hit brings its neighbours with it by design
+        # (recall._passages), so touching lines would prove nothing.
+        for i in range(5):
+            store.add("carol", f"filler {i}", at=now - 80 * 86400 + i * 60)
+        store.add("dflatline", "DFLATLINE SPOKE FIRST", at=now - 40 * 86400)
+        hits = store.search("earliest memory of dflatline",
+                            recall.Settings(oldest=True), nicks=["dflatline"])
+        found = [r["text"] for passage in hits for r in passage]
+        self.assertIn("DFLATLINE SPOKE FIRST", found)
+        self.assertNotIn("BANANAS SPOKE FIRST", found)
+
+
 class TestContextTimestamps(unittest.TestCase):
     """The prompt says what time it is, so the bot can tell now from earlier."""
 

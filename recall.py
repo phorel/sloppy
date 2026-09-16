@@ -98,6 +98,10 @@ class Settings:
     # half-life a two-hundred-day-old line is decayed under the floor.
     half_life_days: float = 14.0
     passages: int = 3
+    # Answer with the EARLIEST lines rather than the best-matching ones, for
+    # "what is the first thing you remember about alice". It sits here beside
+    # half_life_days because both say how to rank rather than what to look for.
+    oldest: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -292,6 +296,13 @@ class RecallStore:
         Scoped to a person and asked nothing else distinctive ("what did alice
         say"), it falls back to their most recent lines, because that is the
         only sensible reading of the question.
+
+        `Settings.oldest` answers a different question altogether -- "what is the first
+        thing you remember about alice" -- with the earliest lines rather than
+        the best-matching ones. Term scoring is skipped for it on purpose: the
+        words in "whats your earliest memory of dflatline" describe the kind of
+        answer wanted, not its subject, and matching them finds lines ABOUT
+        memory instead of the first thing dflatline said.
         """
         settings = Settings() if settings is None else settings
         # The log is chronological, so a time cutoff is a prefix and the pool's
@@ -302,8 +313,10 @@ class RecallStore:
         pool = self._lines[:end]
         if not pool:
             return []
-        wanted = self._discriminating(terms(query))
         theirs = {n.lower() for n in nicks} if nicks else set()
+        if settings.oldest:
+            return self._earliest_from(pool, theirs, settings)
+        wanted = self._discriminating(terms(query))
         ideal = self._ideal(wanted) if wanted else 0.0
         if not ideal:
             # Nothing distinctive was asked. With a person named that is still
@@ -347,6 +360,13 @@ class RecallStore:
             return 1.0
         age_days = max(0.0, (now - record["at"]) / 86400)
         return 0.5 ** (age_days / settings.half_life_days)
+
+    def _earliest_from(self, pool: list, theirs: set,
+                       settings: Settings) -> list[list[dict[str, Any]]]:
+        """The first lines `theirs` said, as passages, or the log's if empty."""
+        hits = [i for i, r in enumerate(pool)
+                if not theirs or r["nick"].lower() in theirs][:settings.passages]
+        return self._passages(hits, settings.passages)
 
     def _latest_from(self, pool: list, theirs: set,
                      settings: Settings) -> list[list[dict[str, Any]]]:

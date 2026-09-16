@@ -3321,11 +3321,39 @@ ABOUT_THE_WORLD_MODES = frozenset({
 # recency prior comes off -- the answer to "when did i say i was going to
 # amsterdam" is as old as it is, and at any half-life a months-old line decays
 # under the relevance floor before it can be found.
+# Written from the phrasings people actually use, not from invented ones. The
+# first version of this was guessed and missed 5 of 7 real examples off the
+# channel -- "whats your earliest memory of dflatline", "what do you remember
+# about probe", "where did spacec0wboy go" -- so the whole feature sat behind a
+# pattern that never fired.
+#
+# "how did" and "why did" are deliberately absent. They read as questions about
+# the past and are usually follow-ups about the conversation ("how did that
+# go"), and the historical path drops the conversation search, which is the one
+# thing a follow-up with no content of its own has to go on.
 _ABOUT_THE_PAST_RE = re.compile(
-    r"\b(?:when did|what did|who said|did (?:i|you|we|he|she|they) (?:ever )?say"
-    r"|remember when|last (?:week|month|year|time)|the other day"
-    r"|a (?:while|few days|few weeks) (?:ago|back)|back (?:then|in)"
-    r"|used to say|ever say)\b",
+    r"\b(?:"
+    r"when did|what did|who said|where did"
+    r"|did (?:i|you|we|he|she|they|[\w\[\]{}`^|\\-]+) (?:ever )?say"
+    r"|do you remember|you remember"
+    r"|remember (?:when|what|who|where|how|why|that|the|about|anything|any)"
+    r"|(?:earliest|oldest|first|fondest|favourite|favorite) (?:memory|memories|thing)"
+    r"|memory of|memories of"
+    r"|what do you (?:know|remember)"
+    r"|used to|ever said|ever told|first time|last time"
+    r"|last (?:week|month|year|night)|the other (?:day|week|night)"
+    r"|(?:days|weeks|months|years) ago|a (?:while|bit) (?:ago|back)|ages ago"
+    r"|back (?:then|in|when)|way back"
+    r")\b",
+    re.IGNORECASE,
+)
+# Asking for the FIRST one rather than the best match. Retrieval ranks by
+# relevance, so without this "your earliest memory of dflatline" returned
+# whatever of dflatline's scored highest, which is not what was asked.
+_THE_EARLIEST_RE = re.compile(
+    r"\b(?:earliest|oldest|first|furthest back)\b[^.?!]{0,30}?"
+    r"\b(?:memory|memories|thing|time|said|say|told)\b"
+    r"|\bfirst thing\b|\bfurthest back\b",
     re.IGNORECASE,
 )
 # First person in a question is the person asking: "when did I say I was going
@@ -3336,6 +3364,11 @@ _FIRST_PERSON_RE = re.compile(r"\b(?:i|me|my|mine|myself)\b", re.IGNORECASE)
 def _asks_about_the_past(text: str) -> bool:
     """True when `text` is asking what was said rather than talking now."""
     return bool(_ABOUT_THE_PAST_RE.search(text))
+
+
+def _asks_for_the_earliest(text: str) -> bool:
+    """True when `text` wants the FIRST thing, not the most relevant thing."""
+    return bool(_THE_EARLIEST_RE.search(text))
 
 
 def _recall_subjects(text: str, asker: str) -> list:
@@ -3429,7 +3462,8 @@ def _about_section(nicks: list) -> str:
             + "\n\n".join(blocks))
 
 
-def _addressing_section(mode: str, asker: str, about: list = ()) -> str:
+def _addressing_section(mode: str, asker: str, about: list = (),
+                        historical: bool = False) -> str:
     """Who the bot is answering and who else is in the room, or "".
 
     `asker` is the person whose message this reply is for, empty for the
@@ -3481,6 +3515,17 @@ def _addressing_section(mode: str, asker: str, about: list = ()) -> str:
         said += (f" {asker} is asking about {names}, so make it about {names}: "
                  f"use what they have really said and done rather than "
                  f"anything you assume about them, and name them.")
+    if historical:
+        # Retrieval can put the right lines in front of it and the model will
+        # still banter past them -- reported live, and measured: asked for the
+        # earliest memory of somebody it was handed that person's first line
+        # and answered with an invented one instead. Being told what to answer
+        # FROM is the other half of the job, and saying "I do not remember" has
+        # to be an available answer or the gap just gets filled.
+        said += (f" {asker} is asking about something from earlier, not about "
+                 f"now. Answer from the lines under EARLIER IN THE CHANNEL: "
+                 f"say what was actually said and roughly when. If it is not "
+                 f"there, say you do not remember it -- do not invent one.")
     elif others:
         # Named so the bot can spell them, not as an invitation: without a
         # question about somebody, wandering off to another name is the bug
@@ -3778,9 +3823,11 @@ def _call_llm(prompt: str, mode: str = MODE_CHAT, asker: str = "") -> str:
     system_prompt = _system_prompt(mode)
     context_block = (
         [] if mode in CONTEXTLESS_MODES
-        else _context_block(prompt, _addressing_section(mode, asker, about),
-                            _about_section(_involved(mode, asker, about)),
-                            asker)
+        else _context_block(
+            prompt,
+            _addressing_section(mode, asker, about,
+                                _asks_about_the_past(prompt)),
+            _about_section(_involved(mode, asker, about)), asker)
     )
     if context_block:
         action("Injected rolling summary + highlights + recent chat as context")
@@ -4402,9 +4449,25 @@ def _recall_passages(prompt: str, recent: list, asker: str,
         half_life_days=0.0 if historical else RECALL_HALF_LIFE_DAYS,
         passages=RECALL_PASSAGES,
     )
-    # What was asked.
-    passages = _recall_store.search(prompt, settings, before=cutoff,
+    earliest = dataclasses.replace(settings, oldest=True)
+    # What was asked. "Earliest" is a different question from "best match":
+    # ranking by relevance answers "what did they say about X", never "what is
+    # the first thing they said", so that one is served by age instead.
+    asked = earliest if _asks_for_the_earliest(prompt) else settings
+    passages = _recall_store.search(prompt, asked, before=cutoff,
                                     nicks=subjects)
+    if historical and _named_others(prompt, asker):
+        # Somebody ELSE was named, so what the room said about them counts as
+        # much as what they said themselves: "where did dflatline go for his
+        # vacation" is answered by both, and on the real log the three lines
+        # about that trip are one of his and two of other people's.
+        #
+        # Only for a third party. A first-person question is about the asker's
+        # OWN words -- "when did i say i was going to amsterdam" -- and an
+        # unscoped pass there answers with somebody else's near-identical plan,
+        # which is not a worse answer but a wrong one.
+        passages = _merge_passages(passages, _recall_store.search(
+            prompt, asked, before=cutoff))
     if recent and not historical:
         # What the room is talking about, which is all a follow-up with no
         # content of its own ("what do you reckon") has to go on. It earns its
