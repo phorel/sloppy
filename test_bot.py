@@ -6822,6 +6822,7 @@ class TestCommandAliases(unittest.TestCase):
         ("!fc", "!factcheck", llmbot_core.MODE_FACTUAL),
         ("!fact", "!factoid", llmbot_core.MODE_FACTOID),
         ("!define", "!research", llmbot_core.MODE_RESEARCH),
+        ("!explain", "!research", llmbot_core.MODE_RESEARCH),
     )
 
     def test_an_alias_reaches_the_same_mode_as_its_command(self):

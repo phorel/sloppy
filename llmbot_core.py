@@ -374,6 +374,7 @@ BANG_COMMANDS = {
     "!science": MODE_SCIENCE,
     "!research": MODE_RESEARCH,
     "!define": MODE_RESEARCH,
+    "!explain": MODE_RESEARCH,
     "!answer": MODE_ANSWER,
     "!serious": MODE_SERIOUS,
     "!quote": MODE_QUOTE,
