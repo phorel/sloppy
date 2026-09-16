@@ -6814,6 +6814,38 @@ class TestMoodTemperature(unittest.TestCase):
         self.assertNotIn("bogus", llmbot_core.MOOD_TEMPERATURES)
 
 
+class TestCommandAliases(unittest.TestCase):
+    """The short and second names for commands reach the same mode."""
+
+    ALIASES = (
+        ("!tr", "!translate", llmbot_core.MODE_TRANSLATE),
+        ("!fc", "!factcheck", llmbot_core.MODE_FACTUAL),
+        ("!fact", "!factoid", llmbot_core.MODE_FACTOID),
+        ("!define", "!research", llmbot_core.MODE_RESEARCH),
+    )
+
+    def test_an_alias_reaches_the_same_mode_as_its_command(self):
+        for alias, command, mode in self.ALIASES:
+            with self.subTest(alias=alias):
+                self.assertEqual(llmbot_core.BANG_COMMANDS[alias], mode)
+                self.assertEqual(llmbot_core.BANG_COMMANDS[command], mode)
+
+    def test_an_alias_carries_its_subject(self):
+        self.assertEqual(
+            llmbot_core._match_trigger("!define entropy"),
+            (llmbot_core.MODE_RESEARCH, "entropy"),
+        )
+
+    def test_the_help_lists_an_alias_beside_its_command(self):
+        # _help_lines groups by mode, so an alias shows up next to the command
+        # it aliases with no second place to remember to update.
+        helped = " ".join(llmbot_core._help_lines())
+        for alias, command, _mode in self.ALIASES:
+            with self.subTest(alias=alias):
+                self.assertIn(alias, helped)
+                self.assertIn(command, helped)
+
+
 class TestRecitalCommands(unittest.TestCase):
     """!quote and !buddha: the two commands that need no argument."""
 
