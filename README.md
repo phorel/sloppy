@@ -1,4 +1,4 @@
-<img width="1536" height="1024" alt="sloppy-logo-v3" src="https://github.com/user-attachments/assets/03b2044c-ed52-48db-afbe-9a8a332c9d2d" />
+<img width="768" height="512" alt="sloppy-logo-v3" src="https://github.com/user-attachments/assets/03b2044c-ed52-48db-afbe-9a8a332c9d2d" />
 
 # Sloppy the moody bot
 
