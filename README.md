@@ -32,6 +32,17 @@ Works with any LLM running under llama.cpp. The better the model, the better the
 - Owners can !purge [nick] (days) data from the bot's memory if needed
   
 
+**Install**
+
+Python 3.11 or newer (it reads its config with `tomllib`). In a checkout:
+
+    python3 -m venv .venv
+    . .venv/bin/activate
+    pip install -r requirements.txt
+
+Then copy `sloppy.toml` settings you want to override into `sloppy.local.toml`
+and point it at your llama.cpp server.
+
 **Usage**
 
 With the TUI, in a terminal:
