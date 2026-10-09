@@ -1,6 +1,6 @@
 # sloppy
 
-**v0.7.5**
+**v0.7.6**
 
 Sloppy is a sarcastic, moody and sometimes funny AI bot for IRC. It connects to a local LLM through llama.cpp and brings a unique flavour of awkward crude humor and genuinely useful features. It understands the chat and has persistent context, making it able to chime in or roast people based on things they said earlier.
 
@@ -84,11 +84,10 @@ first. `connection.llm_check` in `sloppy.toml` decides what happens:
 A model that dies mid-session is worse than one that never started: the bot
 sits in the channel answering every question with a line about its brain being
 offline. After `connection.llm_part_after_seconds` (300 by default, 0 to switch
-it off) of the endpoint not answering, it parts the channel with
-`brain offline, back when the model is` and waits. It stays connected to IRC
-and keeps asking `/props` once a minute, so it rejoins by itself the moment a
-model answers again. An empty chair says the bot is not working, and says it
-once.
+it off) of the endpoint not answering, it renames itself to `<nick>[afk]` and
+answers nobody. It stays in the channel, keeps logging it, and keeps asking
+`/props` once a minute, so it takes its nick back by itself the moment a model
+answers again.
 
 **Owner commands**
 

@@ -28,7 +28,7 @@ import web
 # What this build calls itself. Bumped by hand at release; the tag on the
 # commit and this string are meant to agree, and nothing enforces that but a
 # reader, so change them together.
-VERSION = "0.7.5"
+VERSION = "0.7.6"
 
 # Read at import so the constants below have values; main() reads it again
 # through reload_config() once the sinks exist, which is what reports on it.
@@ -116,6 +116,9 @@ SERVER = config.get("connection.server", "irc.example.net")
 PORT = config.get("connection.port", 6667)
 CHANNEL = config.get("connection.channel", "#channel")
 NICK = config.get("connection.nick", "sloppy")
+# The nick worn while the LLM is out: still in the channel, still logging it,
+# but plainly not answering.
+AFK_NICK = f"{NICK}[afk]"
 REALNAME = config.get("connection.realname", "AI Bot")
 
 # llama.cpp OpenAI-compatible endpoint
@@ -226,12 +229,12 @@ MENTION_CERTAIN_WITHIN = _tune(
 #   off    do not look
 LLM_CHECK = _tune("LLM_CHECK", "connection.llm_check", "ask")
 
-# How long the LLM endpoint may stay unreachable before the bot leaves the
-# channel, in seconds; 0 switches the behaviour off. It stays connected to the
-# server and keeps probing, and rejoins as soon as a model answers again.
-# Leaving is the honest signal: a bot sitting in the channel answering every
-# question with a brain-offline line looks broken, while an empty chair says
-# exactly as much and says it once.
+# How long the LLM endpoint may stay unreachable before the bot goes AFK, in
+# seconds; 0 switches the behaviour off. It stays in the channel under its AFK
+# nick, still logging, answers nobody, and takes its own nick back as soon as a
+# model answers again. A renamed bot is the honest signal: one answering every
+# question with a brain-offline line looks broken, while a nick saying
+# "afk" says exactly as much and says it once.
 LLM_PART_AFTER = _tune("LLM_PART_AFTER", "connection.llm_part_after_seconds", 300.0)
 
 RECALL_ENABLED = _tune("RECALL_ENABLED", "recall.enabled", False)
@@ -335,6 +338,17 @@ STRICT_MODES = frozenset({
     # is not true is just a lie with a fun delivery.
     MODE_QUOTE, MODE_BUDDHA, MODE_FACTOID,
 })
+
+# !research (and its !define/!explain synonyms, and the bare "research"
+# directive), !summarize and !image are the three commands that either hit an
+# external site or lean harder on the model than an ordinary chat line. They
+# share one per-nick hourly bucket -- the point is capping channel spam and
+# engine load overall, not rationing any one of them individually. Chat,
+# quote, translate and the rest are unaffected.
+RATE_LIMIT_MAX_PER_HOUR = _tune("RATE_LIMIT_MAX_PER_HOUR", "limits.heavy_commands_per_hour", 3)
+RATE_LIMIT_WINDOW_SECONDS = 3600.0
+# nick (lowercased) -> monotonic timestamps of uses still inside the window.
+_heavy_command_uses: dict[str, collections.deque[float]] = {}
 
 # "factcheck" is unambiguous enough to work without a colon (and always has).
 # "science" and "research" are ordinary words, so they need the colon or every
@@ -602,10 +616,6 @@ PROFILE_SAVE_INTERVAL = 60
 # minute rather than on every poll pass; it was one HTTP round-trip every two
 # seconds.
 PROPS_PROBE_INTERVAL = 60
-# What the channel is told on the way out when the LLM has gone. In character,
-# like every other line the channel sees, and the only explanation anybody gets
-# -- so it says what is wrong and that it is coming back.
-PART_REASON = "brain offline, back when the model is"
 _activity = {"at": 0.0}
 # The time the bot joined, so the auto-interject opener can wait
 # JOIN_GRACE_PERIOD seconds before it talks (see _within_join_grace). Kept in a
@@ -989,6 +999,12 @@ def _random_mood() -> str:
 
 
 _mood = {"name": _random_mood(), "at": time.monotonic()}
+# Anchors the hourly schedule to when the bot itself started rather than to
+# time.monotonic()'s own (arbitrary, usually boot-time) origin. Without this,
+# a restart can land in the middle of a window that a fresh process had no
+# part in, immediately overriding the resting banter mood with whatever the
+# schedule happened to want at that clock phase.
+_MOOD_SCHEDULE_EPOCH = _mood["at"]
 
 # Signaled when the server has completed registration (001 Welcome received)
 _registered = threading.Event()
@@ -1893,17 +1909,23 @@ def _end_conversation() -> None:
         _conversation["deadline"] = 0.0
 
 
+def _is_own_nick(nick: str) -> bool:
+    """Whether `nick` is the bot, under either of its nicks."""
+    return nick.lower() in (NICK.lower(), AFK_NICK.lower())
+
+
 def _register_user(nick: str) -> None:
     """Remember a channel member, ignoring the bot itself, Botmans, and duplicates."""
     with _prompt_lock:
-        if nick and nick not in (NICK, "Botmans") and nick not in _users["names"]:
+        if (nick and not _is_own_nick(nick) and nick != "Botmans"
+                and nick not in _users["names"]):
             _users["names"].append(nick)
 
 
 def _channel_users() -> list:
     """The channel members (excluding the bot), in the order seen."""
     with _prompt_lock:
-        return [nick for nick in _users["names"] if nick != NICK]
+        return [nick for nick in _users["names"] if not _is_own_nick(nick)]
 
 
 def _set_mood(name: str) -> None:
@@ -1953,7 +1975,8 @@ def _scheduled_mood_locked(now: float) -> str:
     """The mood the schedule wants right now, or "". Caller holds the lock."""
     if not MOOD_BUDGETS:
         return ""
-    window = now - (now % MOOD_WINDOW)
+    elapsed = now - _MOOD_SCHEDULE_EPOCH
+    window = _MOOD_SCHEDULE_EPOCH + elapsed - (elapsed % MOOD_WINDOW)
     if _mood_plan["window"] != window:
         _mood_plan["window"] = window
         _mood_plan["slots"] = _plan_mood_window(window)
@@ -2334,7 +2357,7 @@ def _take_pending_greeting() -> tuple[str, str, str] | None:
 def _handle_join(sock: socket.socket, nick: str) -> None:
     """Greet a nick that just JOINed, unless they only just left. The idle
     timer resets from now so a rejoin is not also read as a long silence."""
-    if not nick or nick.lower() == NICK.lower():
+    if not nick or _is_own_nick(nick):
         return
     # Somebody who joins after we did is never in a 353/352 reply, so without
     # this they would never make the mention list at all.
@@ -2343,8 +2366,8 @@ def _handle_join(sock: socket.socket, nick: str) -> None:
     # _join_greeting_text (which takes the lock itself).
     with _prompt_lock:
         _last_seen[nick] = time.monotonic()
-    # A paused bot stays silent: no greeting while paused.
-    if _paused["on"]:
+    # A paused or AFK bot stays silent: no greeting.
+    if _paused["on"] or _is_absent():
         return
     if _should_greet_join(nick):
         _queue_greeting(nick, "join")
@@ -2360,7 +2383,7 @@ def _handle_quit(nick: str) -> None:
     for anyone no longer on it. Our own PART comes back to us as an event like
     anybody else's and is skipped here, the way _handle_join skips our JOIN.
     """
-    if not nick or nick.lower() == NICK.lower():
+    if not nick or _is_own_nick(nick):
         return
     with _prompt_lock:
         _left_at[nick] = _chatlines["count"]
@@ -2414,6 +2437,9 @@ def _handle_nick_change(old: str, new: str) -> None:
     already printed the old one, which is the correct history.
     """
     if not old or not new or old.lower() == new.lower():
+        return
+    # Our own switch to and from the AFK nick is not somebody changing name.
+    if _is_own_nick(old) or _is_own_nick(new):
         return
     with _prompt_lock:
         _profile_store.link(old, new)
@@ -2505,7 +2531,7 @@ def _note_recent(message: str, sender: str) -> None:
     A long silence from this nick queues a welcome back rather than returning
     one: a greeting is an LLM call now, and this runs on the receiver thread.
     """
-    if sender and sender.lower() == NICK.lower():
+    if sender and _is_own_nick(sender):
         return
     # One-word lines and lines shorter than MIN_CHAT_CHARS carry no context the
     # model needs, so they are not stored in the recent-history buffer. The
@@ -2708,7 +2734,7 @@ def _mention_targets_locked() -> list:
     targets = []
 
     def push(nick):
-        if nick and nick != NICK and nick not in targets:
+        if nick and not _is_own_nick(nick) and nick not in targets:
             targets.append(nick)
 
     addressed = _conversation["nick"]
@@ -3028,6 +3054,33 @@ def _handle_ignore(sock: socket.socket, req: Request, verb: str,
     send(sock, f"PRIVMSG {reply_to} :Listening to {target} again.")
 
 
+def _rate_limit_wait(sender: str) -> float | None:
+    """None if `sender` may use a heavy command now, else seconds to wait.
+
+    Allowing a use records it in the same call, so a caller that gets None
+    back has already spent the slot -- there is no separate "and now commit
+    it" step to forget. The window is a rolling hour, not a clock-aligned one:
+    the oldest use ages out and frees a slot exactly 3600s after it happened.
+    """
+    now = time.monotonic()
+    key = sender.lower()
+    with _prompt_lock:
+        uses = _heavy_command_uses.setdefault(key, collections.deque())
+        while uses and now - uses[0] >= RATE_LIMIT_WINDOW_SECONDS:
+            uses.popleft()
+        if len(uses) >= RATE_LIMIT_MAX_PER_HOUR:
+            return RATE_LIMIT_WINDOW_SECONDS - (now - uses[0])
+        uses.append(now)
+        return None
+
+
+def _rate_limit_reply(wait: float) -> str:
+    """The line sent back when a heavy command is capped for now."""
+    return (f"Research/summarize/image requests are currently limited to "
+            f"{RATE_LIMIT_MAX_PER_HOUR} per hour. Try again in {_fmt_span(wait)} "
+            f"or insert more tokens")
+
+
 def _handle_immediate_command(sock: socket.socket, message: str,
                               req: Request) -> bool:
     """Answer the commands that need no LLM call. True if one was handled.
@@ -3075,37 +3128,57 @@ def _handle_immediate_command(sock: socket.socket, message: str,
     # image Tim just posted") is treated as an image request first.
     vision = _match_vision_trigger(message)
     if vision is not None:
-        if not _vision_active():
-            # No vision model in service, so say so rather than answering blind.
-            send(sock, f"PRIVMSG {reply_to} :[AI] I can't see images right now "
-                       "(no vision model loaded).")
-            return True
-        url, prompt, mode = vision
-        # The LLM server fetches this URL itself, from wherever it runs, and
-        # the bot then reads out what it saw. Unchecked, that is a stranger in
-        # the channel using the bot as a window into the network the model
-        # sits on -- the same hole web.fetch already refuses for !summarize,
-        # reached by a path that was not going through it.
-        refusal = web.check_url(url)
-        if refusal:
-            send(sock, f"PRIVMSG {reply_to} :Not fetching that one: {refusal}")
-            warning(f"[AI] refused an image URL from {sender}: {url} ({refusal})")
-            return True
-        _queue_vision(url, sender, prompt, reply_to)
-        _note_conversation(sender)
-        _reset_chatter()
-        action(f"[AI] Captured image request from {sender}: {url}")
+        _handle_vision_command(sock, vision, sender, reply_to)
         return True
 
     if WEB_ENABLED:
         page_url = _match_summarize_trigger(message)
         if page_url is not None:
-            _queue_page(page_url, sender, reply_to)
-            _note_conversation(sender)
-            _reset_chatter()
-            action(f"[AI] captured a page request from {sender}: {page_url}")
+            _handle_summarize_command(sock, page_url, sender, reply_to)
             return True
     return False
+
+
+def _handle_vision_command(sock: socket.socket, vision: tuple[str, str, str],
+                           sender: str, reply_to: str) -> None:
+    """Serve a matched !image trigger: capability, URL safety, then the cap."""
+    if not _vision_active():
+        # No vision model in service, so say so rather than answering blind.
+        send(sock, f"PRIVMSG {reply_to} :[AI] I can't see images right now "
+                   "(no vision model loaded).")
+        return
+    url, prompt, _mode = vision
+    # The LLM server fetches this URL itself, from wherever it runs, and the
+    # bot then reads out what it saw. Unchecked, that is a stranger in the
+    # channel using the bot as a window into the network the model sits on --
+    # the same hole web.fetch already refuses for !summarize, reached by a
+    # path that was not going through it.
+    refusal = web.check_url(url)
+    if refusal:
+        send(sock, f"PRIVMSG {reply_to} :Not fetching that one: {refusal}")
+        warning(f"[AI] refused an image URL from {sender}: {url} ({refusal})")
+        return
+    wait = _rate_limit_wait(sender)
+    if wait is not None:
+        send(sock, f"PRIVMSG {reply_to} :{_rate_limit_reply(wait)}")
+        return
+    _queue_vision(url, sender, prompt, reply_to)
+    _note_conversation(sender)
+    _reset_chatter()
+    action(f"[AI] Captured image request from {sender}: {url}")
+
+
+def _handle_summarize_command(sock: socket.socket, page_url: str,
+                              sender: str, reply_to: str) -> None:
+    """Serve a matched !summarize trigger, once past the rate cap."""
+    wait = _rate_limit_wait(sender)
+    if wait is not None:
+        send(sock, f"PRIVMSG {reply_to} :{_rate_limit_reply(wait)}")
+        return
+    _queue_page(page_url, sender, reply_to)
+    _note_conversation(sender)
+    _reset_chatter()
+    action(f"[AI] captured a page request from {sender}: {page_url}")
 
 
 def _handle_ai_prompt(sock: socket.socket, message: str, req: Request) -> bool:
@@ -3127,6 +3200,12 @@ def _handle_ai_prompt(sock: socket.socket, message: str, req: Request) -> bool:
     if matched is None:
         return False
     mode, prompt = matched
+
+    if mode == MODE_RESEARCH:
+        wait = _rate_limit_wait(sender)
+        if wait is not None:
+            send(sock, f"PRIVMSG {reply_to} :{_rate_limit_reply(wait)}")
+            return True
 
     if _is_shutup(prompt):
         with _prompt_lock:
@@ -3212,7 +3291,18 @@ def _handle_line(sock: socket.socket, line: str) -> bool:
         return True
     if parsed.private:
         return _handle_private(sock, parsed)
+    return _handle_channel_line(sock, line, parsed)
+
+
+def _handle_channel_line(sock: socket.socket, line: str, parsed: Privmsg) -> bool:
+    """Remember a line said in the channel, and answer it unless we are AFK.
+
+    Returns True when the receiver should still log it, like _handle_line.
+    """
     _note_recent(parsed.text, parsed.sender)
+    if _is_absent():
+        irc(f"< {line}")
+        return True
     request = Request(parsed.sender, CHANNEL, owner=_is_owner(parsed.mask))
     if _handle_ai_prompt(sock, parsed.text, request):
         return False
@@ -3981,14 +4071,14 @@ def _llm_down_for() -> float:
 
 
 def _is_absent() -> bool:
-    """Whether the bot has left the channel to wait out an LLM outage."""
+    """Whether the bot is AFK, waiting out an LLM outage."""
     with _prompt_lock:
         return _absent["on"]
 
 
 def _should_sit_out() -> bool:
-    """Whether the outage has run long enough that the bot should not be in the
-    channel. Off entirely when LLM_PART_AFTER is 0."""
+    """Whether the outage has run long enough that the bot should go AFK. Off
+    entirely when LLM_PART_AFTER is 0."""
     return LLM_PART_AFTER > 0 and _llm_down_for() >= LLM_PART_AFTER
 
 
@@ -5120,19 +5210,19 @@ def _connect(gone: threading.Event) -> socket.socket | None:
     sock.settimeout(None)
     threading.Thread(target=receiver, args=(sock, gone), daemon=True).start()
     try:
-        send(sock, f"NICK {NICK}")
+        # An outage that was already long enough to go AFK for is still long
+        # enough on the other side of a reconnect, so register under the AFK
+        # nick rather than join and rename two seconds later.
+        sitting_out = _should_sit_out()
+        nick = AFK_NICK if sitting_out else NICK
+        send(sock, f"NICK {nick}")
         send(sock, f"USER {NICK} 0 * :{REALNAME}")
         if not _wait_to_register():
             if _stop_event.is_set():
                 raise TimeoutError("asked to stop while registering")
             raise TimeoutError(f"no 001 Welcome within {REGISTER_TIMEOUT}s")
-        # An outage that was already long enough to leave for is still long
-        # enough on the other side of a reconnect, so register and stay out
-        # rather than join and walk back out two seconds later.
-        sitting_out = _should_sit_out()
-        if not sitting_out:
-            send(sock, f"JOIN {CHANNEL}")
-            _request_userlist(sock)
+        send(sock, f"JOIN {CHANNEL}")
+        _request_userlist(sock)
     except Exception as e:
         warning(f"[Connect] registration failed: {e}")
         # Closing wakes the receiver thread, which sets `gone` on its way out.
@@ -5142,9 +5232,9 @@ def _connect(gone: threading.Event) -> socket.socket | None:
         _absent["on"] = sitting_out
         # The grace period starts again, so the auto-interject opener waits for
         # the WHO/NAMES replies now on their way.
-        _joined["at"] = 0.0 if sitting_out else time.monotonic()
+        _joined["at"] = time.monotonic()
     if sitting_out:
-        warning(f"[Connected] staying out of {CHANNEL}: still no LLM")
+        warning(f"[Connected] joined {CHANNEL} as {AFK_NICK}: still no LLM")
     else:
         action(f"[Connected] joined {CHANNEL}")
     return sock
@@ -5153,8 +5243,8 @@ def _connect(gone: threading.Event) -> socket.socket | None:
 def _drop_queued_work() -> None:
     """Throw away every queued request and greeting.
 
-    Called when the bot leaves the channel: whoever asked is about to watch it
-    walk out, and answering them when it walks back in minutes later would be
+    Called when the bot goes AFK: whoever asked is about to watch it change
+    nick, and answering them when it is back minutes later would be
     replying to a conversation that has moved on.
     """
     with _prompt_lock:
@@ -5172,40 +5262,31 @@ def _drop_queued_work() -> None:
         _pending_greetings.clear()
 
 
-def _leave_channel(sock: socket.socket) -> None:
-    """PART the channel for the duration of an LLM outage, staying connected.
+def _go_afk(sock: socket.socket) -> None:
+    """Take the AFK nick for the duration of an LLM outage, staying in the channel.
 
-    The link itself is fine, so dropping it would throw away the reconnect
-    backoff, the roster and the server's goodwill to say something about the
-    model. The PART reason says why, in the one place everybody in the channel
-    will see it.
+    The link is fine and so is the channel, so the bot keeps sitting in it and
+    logging it. The nick says why nobody is answering, in the one place
+    everybody will see it.
     """
-    send(sock, f"PART {CHANNEL} :{PART_REASON}")
+    send(sock, f"NICK {AFK_NICK}")
     _drop_queued_work()
     with _prompt_lock:
         _absent["on"] = True
-        _joined["at"] = 0.0
-        # A channel we are not in has no roster: the mention list must not name
-        # people we can no longer see.
-        _users["names"].clear()
-    warning(f"[AI] left {CHANNEL}: no LLM for "
-            f"{int(_llm_down_for())}s; rejoining when one answers")
+    warning(f"[AI] now {AFK_NICK}: no LLM for "
+            f"{int(_llm_down_for())}s; back when one answers")
 
 
-def _rejoin_channel(sock: socket.socket) -> None:
-    """JOIN again after the LLM came back, and ask who is here now."""
-    send(sock, f"JOIN {CHANNEL}")
-    _request_userlist(sock)
+def _come_back(sock: socket.socket) -> None:
+    """Take the real nick back after the LLM answered again."""
+    send(sock, f"NICK {NICK}")
     with _prompt_lock:
         _absent["on"] = False
-        # Same reason as on a fresh connection: the opener waits for the
-        # WHO/NAMES replies now on their way.
-        _joined["at"] = time.monotonic()
-    action(f"[Connected] rejoined {CHANNEL}: LLM back")
+    action(f"[AI] back as {NICK}: LLM back")
 
 
 def _maintain_presence(sock: socket.socket) -> None:
-    """Leave the channel while the LLM is out, and come back when it returns.
+    """Go AFK while the LLM is out, and come back when it returns.
 
     Polled rather than event-driven because the health it reads is polled too
     (see _probe_props); at POLL_INTERVAL the lag is nothing beside the minutes
@@ -5216,9 +5297,9 @@ def _maintain_presence(sock: socket.socket) -> None:
         healthy = _llm_health["ok"]
     if absent:
         if healthy:
-            _rejoin_channel(sock)
+            _come_back(sock)
     elif _should_sit_out():
-        _leave_channel(sock)
+        _go_afk(sock)
 
 
 def _run_session(sock: socket.socket, gone: threading.Event) -> None:
@@ -5227,7 +5308,8 @@ def _run_session(sock: socket.socket, gone: threading.Event) -> None:
         while not _stop_event.is_set() and not gone.is_set():
             _probe_props_if_due()
             _maintain_presence(sock)
-            # Off the channel, the unprompted talk has no room to talk into.
+            # AFK, the unprompted talk would be talking to a room that has been
+            # told nobody is answering.
             # Requests are still served: the only ones that can arrive are an
             # owner's private messages, and an owner asking why it is quiet
             # deserves the brain-offline line rather than silence.
