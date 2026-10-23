@@ -2910,7 +2910,8 @@ class TestQuitTracking(unittest.TestCase):
         llmbot_core._handle_quit("alice")
         with llmbot_core._prompt_lock:
             llmbot_core._chatlines["count"] = 20  # 10 chatlines since leave
-        self.assertTrue(llmbot_core._should_greet_join("alice"))
+        with mock.patch.object(llmbot_core, "GREET_REJOIN_CHATLINES", 5):
+            self.assertTrue(llmbot_core._should_greet_join("alice"))
 
     def test_quit_ignores_empty_nick(self):
         llmbot_core._handle_quit("")
@@ -3877,10 +3878,10 @@ class TestReconnect(unittest.TestCase):
             self.assertEqual(llmbot_core._users["names"], [])
             self.assertGreater(llmbot_core._joined["at"], 0.0)
 
-    def test_a_reconnect_during_an_outage_registers_but_stays_out(self):
+    def test_a_reconnect_during_an_outage_registers_as_afk(self):
         # The outage is a property of the model, not of the link: a reconnect
-        # in the middle of one should not walk into the channel and walk back
-        # out on the next poll pass.
+        # in the middle of one should not register under the real nick and
+        # rename on the next poll pass.
         _reset_llm_health(self)
         llmbot_core._note_llm_health(False)
         _age_outage(llmbot_core.LLM_PART_AFTER)
@@ -3892,11 +3893,9 @@ class TestReconnect(unittest.TestCase):
         ):
             self.assertIs(llmbot_core._connect(threading.Event()), sock)
         sent = b"".join(c.args[0] for c in sock.send.call_args_list)
-        self.assertIn(b"NICK ", sent)
-        self.assertNotIn(b"JOIN ", sent)
+        self.assertIn(f"NICK {llmbot_core.AFK_NICK}\r\n".encode(), sent)
+        self.assertIn(b"JOIN ", sent)
         self.assertTrue(llmbot_core._is_absent())
-        with llmbot_core._prompt_lock:
-            self.assertEqual(llmbot_core._joined["at"], 0.0)
 
     def test_roster_is_cleared_before_the_link_exists(self):
         # The 353 NAMREPLY for our JOIN can land while _connect is still in the
@@ -6628,6 +6627,29 @@ class TestScheduledMoods(unittest.TestCase):
         self.assertEqual(llmbot_core._plan_mood_window(0.0), [])
         self.assertEqual(llmbot_core._current_mood(), llmbot_core.MOOD_BANTER)
 
+    def test_the_schedule_window_is_anchored_to_when_the_bot_started(self):
+        """A restart must not inherit a phase from time.monotonic()'s own
+        origin (on Linux, usually system boot) -- only from when the bot's
+        own mood system came up. Without this, a restart on a machine that
+        had been up for a while could land straight inside a scheduled
+        window a fresh process had no part in, overriding the resting
+        banter mood it is supposed to open in.
+
+        Two arbitrary "now"s that are each exactly at their own epoch must
+        compute the same window start (their epoch), regardless of how far
+        apart those epochs are in absolute terms."""
+        self._budgets(mean=10)
+        calls = []
+        with mock.patch.object(
+            llmbot_core, "_plan_mood_window", side_effect=lambda w: calls.append(w) or []
+        ):
+            for epoch in (500.0, 987654.0):
+                with llmbot_core._prompt_lock:
+                    llmbot_core._mood_plan["window"] = -1.0
+                with mock.patch.object(llmbot_core, "_MOOD_SCHEDULE_EPOCH", epoch):
+                    llmbot_core._scheduled_mood_locked(epoch)
+        self.assertEqual(calls, [500.0, 987654.0])
+
     def test_a_scheduled_window_changes_the_persona(self):
         self._budgets(mean=60)
         with llmbot_core._prompt_lock:
@@ -9130,7 +9152,7 @@ class TestLlmHealth(unittest.TestCase):
 
 
 class TestOutagePresence(unittest.TestCase):
-    """The bot leaves the channel for a long outage and comes back after it."""
+    """The bot goes AFK for a long outage and comes back after it."""
 
     def setUp(self):
         _reset_llm_health(self)
@@ -9147,36 +9169,37 @@ class TestOutagePresence(unittest.TestCase):
         llmbot_core._note_llm_health(False)
         _age_outage(seconds)
 
-    def test_a_short_outage_keeps_the_bot_in_the_channel(self):
+    def test_a_short_outage_keeps_the_bot_as_it_was(self):
         self._go_down(llmbot_core.LLM_PART_AFTER / 2)
         llmbot_core._maintain_presence(self.sock)
         self.assertFalse(llmbot_core._is_absent())
         self.assertEqual(self._sent(), [])
 
-    def test_a_long_outage_parts_with_a_reason(self):
+    def test_a_long_outage_changes_the_nick(self):
         self._go_down(llmbot_core.LLM_PART_AFTER)
         llmbot_core._maintain_presence(self.sock)
         self.assertTrue(llmbot_core._is_absent())
-        self.assertEqual(
-            self._sent(),
-            [f"PART {llmbot_core.CHANNEL} :{llmbot_core.PART_REASON}\r\n"])
+        self.assertEqual(self._sent(), [f"NICK {llmbot_core.AFK_NICK}\r\n"])
 
-    def test_parting_does_not_drop_the_link(self):
-        # The server is fine; it is the model that is gone. Disconnecting would
-        # throw away the session to say something about a different machine.
+    def test_the_afk_nick_is_the_nick_plus_afk(self):
+        self.assertEqual(llmbot_core.AFK_NICK, f"{llmbot_core.NICK}[afk]")
+
+    def test_going_afk_does_not_leave_or_drop_the_link(self):
         self._go_down(llmbot_core.LLM_PART_AFTER)
         llmbot_core._maintain_presence(self.sock)
+        self.assertFalse(any(m.startswith("PART") for m in self._sent()))
         self.sock.close.assert_not_called()
 
-    def test_parting_empties_the_roster(self):
+    def test_going_afk_keeps_the_roster(self):
         self._go_down(llmbot_core.LLM_PART_AFTER)
         llmbot_core._maintain_presence(self.sock)
         with llmbot_core._prompt_lock:
-            self.assertEqual(list(llmbot_core._users["names"]), [])
-            self.assertEqual(llmbot_core._joined["at"], 0.0)
+            self.assertEqual(list(llmbot_core._users["names"]),
+                             ["alice", "bob"])
+            self.assertGreater(llmbot_core._joined["at"], 0.0)
 
-    def test_parting_drops_queued_work(self):
-        # Answering on the way back in would be answering a conversation that
+    def test_going_afk_drops_queued_work(self):
+        # Answering on the way back would be answering a conversation that
         # ended minutes ago.
         with llmbot_core._prompt_lock:
             llmbot_core._pending["prompt"] = "still there?"
@@ -9191,32 +9214,22 @@ class TestOutagePresence(unittest.TestCase):
             self.assertEqual(llmbot_core._pending_page["url"], "")
             self.assertEqual(llmbot_core._pending_greetings, [])
 
-    def test_it_only_parts_once(self):
+    def test_it_only_renames_once(self):
         self._go_down(llmbot_core.LLM_PART_AFTER)
         llmbot_core._maintain_presence(self.sock)
         llmbot_core._maintain_presence(self.sock)
         self.assertEqual(len(self._sent()), 1)
 
-    def test_it_rejoins_when_the_model_answers(self):
+    def test_it_takes_its_nick_back_when_the_model_answers(self):
         self._go_down(llmbot_core.LLM_PART_AFTER)
         llmbot_core._maintain_presence(self.sock)
         self.sock.send.reset_mock()
         llmbot_core._note_llm_health(True)
         llmbot_core._maintain_presence(self.sock)
         self.assertFalse(llmbot_core._is_absent())
-        self.assertEqual(self._sent(), [f"JOIN {llmbot_core.CHANNEL}\r\n",
-                                        f"WHO {llmbot_core.CHANNEL}\r\n"])
+        self.assertEqual(self._sent(), [f"NICK {llmbot_core.NICK}\r\n"])
 
-    def test_rejoining_restarts_the_grace_period(self):
-        # It is a fresh room as far as the opener is concerned: the WHO reply
-        # has not landed yet and nothing should be said into an empty roster.
-        self._go_down(llmbot_core.LLM_PART_AFTER)
-        llmbot_core._maintain_presence(self.sock)
-        llmbot_core._note_llm_health(True)
-        llmbot_core._maintain_presence(self.sock)
-        self.assertTrue(llmbot_core._within_join_grace())
-
-    def test_it_stays_out_while_the_model_is_still_gone(self):
+    def test_it_stays_afk_while_the_model_is_still_gone(self):
         self._go_down(llmbot_core.LLM_PART_AFTER)
         llmbot_core._maintain_presence(self.sock)
         self.sock.send.reset_mock()
@@ -9225,20 +9238,50 @@ class TestOutagePresence(unittest.TestCase):
         self.assertTrue(llmbot_core._is_absent())
         self.assertEqual(self._sent(), [])
 
-    def test_our_own_part_is_not_read_as_somebody_leaving(self):
-        line = (f":{llmbot_core.NICK}!u@h PART {llmbot_core.CHANNEL} "
-                f":{llmbot_core.PART_REASON}")
-        llmbot_core._handle_line(self.sock, line)
+    def test_our_own_rename_is_not_somebody_changing_name(self):
+        for old, new in ((llmbot_core.NICK, llmbot_core.AFK_NICK),
+                         (llmbot_core.AFK_NICK, llmbot_core.NICK)):
+            llmbot_core._handle_line(
+                self.sock, f":{old}!u@h NICK :{new}")
         with llmbot_core._prompt_lock:
-            self.assertNotIn(llmbot_core.NICK, llmbot_core._left_at)
+            self.assertNotIn(llmbot_core.AFK_NICK, llmbot_core._users["names"])
+            self.assertNotIn(llmbot_core.NICK, llmbot_core._users["names"])
 
-    def test_the_status_pane_says_it_is_out(self):
+    def test_our_own_afk_join_is_not_greeted_or_listed(self):
+        llmbot_core._handle_line(
+            self.sock,
+            f":{llmbot_core.AFK_NICK}!u@h JOIN {llmbot_core.CHANNEL}")
+        with llmbot_core._prompt_lock:
+            self.assertNotIn(llmbot_core.AFK_NICK, llmbot_core._users["names"])
+            self.assertEqual(llmbot_core._pending_greetings, [])
+
+    def test_a_channel_line_while_afk_is_remembered_not_answered(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        before = len(llmbot_core._recent_lines)
+        llmbot_core._handle_line(
+            self.sock,
+            f":alice!u@h PRIVMSG {llmbot_core.CHANNEL} "
+            f":{llmbot_core.NICK}: are you there, this is a real question")
+        self.assertEqual(len(llmbot_core._recent_lines), before + 1)
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending["prompt"], "")
+
+    def test_somebody_joining_while_afk_is_not_greeted(self):
+        self._go_down(llmbot_core.LLM_PART_AFTER)
+        llmbot_core._maintain_presence(self.sock)
+        llmbot_core._handle_line(
+            self.sock, f":carol!u@h JOIN {llmbot_core.CHANNEL}")
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_greetings, [])
+
+    def test_the_status_pane_says_it_is_afk(self):
         import llmbot_tui
 
         self._go_down(llmbot_core.LLM_PART_AFTER)
         llmbot_core._maintain_presence(self.sock)
         rendered = llmbot_tui._format_status(llmbot_core.status_snapshot())
-        self.assertIn("parted", rendered)
+        self.assertIn("afk", rendered)
 
 
 class TestOutageSilence(unittest.TestCase):
@@ -9441,8 +9484,9 @@ class TestGreetingDelivery(unittest.TestCase):
             self.assertFalse(llmbot_core._busy["on"])
 
     def test_one_greeting_per_pass(self):
-        llmbot_core._queue_greeting("one", "join")
-        llmbot_core._queue_greeting("two", "join")
+        with mock.patch.object(llmbot_core, "GREET_QUEUE_MAX", 2):
+            llmbot_core._queue_greeting("one", "join")
+            llmbot_core._queue_greeting("two", "join")
         with mock.patch.object(llmbot_core, "_call_llm", return_value="hi"):
             llmbot_core._process_pending_greeting(self.sock)
         with llmbot_core._prompt_lock:
@@ -10496,6 +10540,121 @@ class TestSummarizeDelivery(unittest.TestCase):
             llmbot_core.WEB_MAX_REPLY_LINES,
         )
         self.assertGreater(llmbot_core.WEB_MAX_REPLY_LINES, llmbot_core.IRC_MAX_REPLY_LINES)
+
+
+class TestHeavyCommandRateLimit(unittest.TestCase):
+    """!research (and its !define/!explain synonyms), !summarize and !image
+    share one per-nick hourly bucket. A use past the cap is refused with a
+    reply instead of being queued; ordinary chat, !quote and !translate are
+    untouched."""
+
+    def setUp(self):
+        self._old_max = llmbot_core.RATE_LIMIT_MAX_PER_HOUR
+        llmbot_core.RATE_LIMIT_MAX_PER_HOUR = 3
+        llmbot_core._heavy_command_uses.clear()
+        self._old_action = llmbot_core.action
+        self._old_warning = llmbot_core.warning
+        llmbot_core.action = lambda _m: None
+        llmbot_core.warning = lambda _m: None
+        with llmbot_core._prompt_lock:
+            self._old_override = llmbot_core._vision["override"]
+            llmbot_core._vision["override"] = True
+            llmbot_core._pending_vision["url"] = ""
+            llmbot_core._pending_page["url"] = ""
+            llmbot_core._pending["prompt"] = ""
+        llmbot_core._end_conversation()
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        llmbot_core.RATE_LIMIT_MAX_PER_HOUR = self._old_max
+        llmbot_core._heavy_command_uses.clear()
+        llmbot_core.action = self._old_action
+        llmbot_core.warning = self._old_warning
+        with llmbot_core._prompt_lock:
+            llmbot_core._vision["override"] = self._old_override
+            llmbot_core._pending_vision["url"] = ""
+            llmbot_core._pending_page["url"] = ""
+
+    def _said(self, sock):
+        return b" ".join(c.args[0] for c in sock.send.call_args_list)
+
+    def test_research_is_blocked_on_the_fourth_use_within_the_hour(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        for _ in range(3):
+            llmbot_core._handle_ai_prompt(
+                sock, "!research entropy", llmbot_core.Request("alice", llmbot_core.CHANNEL))
+            self.assertEqual(llmbot_core.get_pending_prompt(), "entropy")
+        llmbot_core._handle_ai_prompt(
+            sock, "!research entropy", llmbot_core.Request("alice", llmbot_core.CHANNEL))
+        self.assertEqual(llmbot_core.get_pending_prompt(), "")
+        self.assertIn(b"limit", self._said(sock))
+
+    def test_define_and_explain_share_the_research_bucket(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        for text in ("!research a", "!define b", "!explain c"):
+            llmbot_core._handle_ai_prompt(
+                sock, text, llmbot_core.Request("bob", llmbot_core.CHANNEL))
+            llmbot_core.get_pending_prompt()
+        llmbot_core._handle_ai_prompt(
+            sock, "!explain d", llmbot_core.Request("bob", llmbot_core.CHANNEL))
+        self.assertEqual(llmbot_core.get_pending_prompt(), "")
+        self.assertIn(b"limit", self._said(sock))
+
+    def test_image_summarize_and_research_share_one_bucket(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        with mock.patch.object(web, "check_url", return_value=""):
+            llmbot_core._handle_immediate_command(
+                sock, "!image https://i.imgur.com/a.png",
+                llmbot_core.Request("carol", llmbot_core.CHANNEL))
+        llmbot_core._handle_immediate_command(
+            sock, "!summarize https://example.com/a",
+            llmbot_core.Request("carol", llmbot_core.CHANNEL))
+        llmbot_core._handle_ai_prompt(
+            sock, "!research x", llmbot_core.Request("carol", llmbot_core.CHANNEL))
+        self.assertEqual(llmbot_core.get_pending_prompt(), "x")
+        with llmbot_core._prompt_lock:
+            llmbot_core._pending_vision["url"] = ""  # as the vision worker would take it
+
+        # A 4th heavy command from the same nick is refused, whichever of the
+        # three it is -- the bucket is shared, not per-command.
+        with mock.patch.object(web, "check_url", return_value=""):
+            llmbot_core._handle_immediate_command(
+                sock, "!image https://i.imgur.com/b.png",
+                llmbot_core.Request("carol", llmbot_core.CHANNEL))
+        with llmbot_core._prompt_lock:
+            self.assertEqual(llmbot_core._pending_vision["url"], "")
+        self.assertIn(b"limit", self._said(sock))
+
+    def test_a_different_nick_has_its_own_bucket(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        for _ in range(3):
+            llmbot_core._handle_ai_prompt(
+                sock, "!research x", llmbot_core.Request("dave", llmbot_core.CHANNEL))
+            llmbot_core.get_pending_prompt()
+        llmbot_core._handle_ai_prompt(
+            sock, "!research y", llmbot_core.Request("erin", llmbot_core.CHANNEL))
+        self.assertEqual(llmbot_core.get_pending_prompt(), "y")
+
+    def test_the_refusal_names_the_wait(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        for _ in range(3):
+            llmbot_core._handle_ai_prompt(
+                sock, "!research x", llmbot_core.Request("frank", llmbot_core.CHANNEL))
+            llmbot_core.get_pending_prompt()
+        llmbot_core._handle_ai_prompt(
+            sock, "!research x", llmbot_core.Request("frank", llmbot_core.CHANNEL))
+        self.assertIn(b"minute", self._said(sock))
+
+    def test_chat_and_quote_are_not_rate_limited(self):
+        sock = mock.MagicMock(spec=socket.socket)
+        for _ in range(5):
+            llmbot_core._handle_ai_prompt(
+                sock, f"{llmbot_core.NICK}: hello", llmbot_core.Request("gil", llmbot_core.CHANNEL))
+            self.assertEqual(llmbot_core.get_pending_prompt(), "hello")
+        for _ in range(5):
+            llmbot_core._handle_ai_prompt(
+                sock, "!quote", llmbot_core.Request("gil", llmbot_core.CHANNEL))
+            self.assertNotEqual(llmbot_core.get_pending_prompt(), "")
 
 
 class TestBangCommands(unittest.TestCase):
